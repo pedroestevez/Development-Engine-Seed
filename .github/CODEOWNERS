@@ -1,0 +1,19 @@
+# CODEOWNERS — engine files require Pedro's review (docs/ENGINE.md §16)
+#
+# STAGED, not yet load-bearing: this repo currently requires 0 approvals
+# (see docs/GATES.md — the Amendment gate today is branch protection alone,
+# verified by a rejected direct push, ALI-110). At 0 required approvals,
+# CODEOWNERS assigns ownership but does not force review — GitHub only
+# blocks a merge on a missing code-owner review once required-approvals
+# is >= 1. This file becomes load-bearing the moment the crew gets its
+# own GitHub identity (ALI-100's body) and required approvals goes to 1:
+# the crew pushes/opens PRs under that identity, Pedro reviews as code
+# owner, and self-approval is structurally impossible.
+#
+# In this seed repo every file listed below is, practically, everything —
+# that's correct, because here every merge to main *is* the Amendment gate.
+
+/.claude/**   @pedroestevez
+/CLAUDE.md    @pedroestevez
+/docs/**      @pedroestevez
+/.github/**   @pedroestevez

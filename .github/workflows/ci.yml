@@ -1,0 +1,73 @@
+name: CI
+
+# The Amendment gate's CI half (docs/GATES.md). Runs on every PR against
+# main and on every push to main, so no change to this repo — engine file
+# or otherwise — lands without at least these checks having run.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Least privilege: this workflow only reads the repo and writes logs.
+permissions:
+  contents: read
+
+jobs:
+  markdown-links:
+    name: Markdown cross-reference check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Vendored, dependency-free script (scripts/check-md-links.js) --
+      # this repo has no package.json, so nothing is installed. Validates
+      # every relative cross-reference between CLAUDE.md, README.md,
+      # docs/*.md, and .claude/**/*.md resolves to a real file/anchor.
+      - name: Check cross-references
+        run: node scripts/check-md-links.js
+
+  roster-consistency:
+    name: Agent roster consistency (ALI-107 criterion-5)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Diffs the agent files docs/ENGINE.md §14's tree lists against what
+      # actually exists in .claude/agents/, in both directions. Guards the
+      # Coach-orphan class of drift: a role documented but never given a
+      # file, or a file added/renamed on disk without updating the tree.
+      - name: Check roster matches docs/ENGINE.md §14
+        run: node scripts/check-roster-consistency.js
+
+  dispatcher-tests:
+    name: Dispatcher unit tests (placeholder)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # The dispatcher (docs/ENGINE.md §17) hasn't landed yet -- no
+      # package.json exists in this repo. Once it does, this step starts
+      # actually running `npm test` and becomes a real gate instead of a
+      # no-op success. Until then it must succeed, not skip, so the job
+      # stays green and doesn't block PRs on work that isn't scoped yet.
+      - name: Run dispatcher tests if present
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+            npm test
+          else
+            echo "no package.json — dispatcher not yet landed"
+          fi
