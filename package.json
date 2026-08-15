@@ -1,0 +1,19 @@
+{
+  "name": "development-engine-seed",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Development Engine — dispatcher core (ALI-102): pure admission, partitioning, and model-tier decision functions.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.5"
+  }
+}
