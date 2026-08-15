@@ -11,7 +11,9 @@ This repo is the seed of an autonomous build crew. Full spec: `docs/ENGINE.md` (
 
 ## Pipeline
 
-Triage → Backlog → Ready → In Progress → Done. The build loop never reads Triage. Backlog entry is Planner-suggested curation; the spec pass triggers on **cycle nomination**; the binding gate is **cycle approval**. Gated/blocked issues park in "Needs Pedro".
+Backlog → Ready → In Progress → In Review → Done. These are the **literal Linear status names** — the dispatcher matches on them, so docs and board must never drift apart. The build loop never reads Backlog. Backlog exit is Planner-suggested curation; the spec pass triggers on **cycle nomination**; the binding gate is **cycle approval**.
+
+Two off-ramps, and the distinction matters: **Parked** = a backstop interrupted the work, an artifact exists, no decision needed — the next run drains it first. **Needs Pedro** = blocked on a human decision, excluded from runs until answered. No separate Triage status: to the build loop it would be identical to Backlog, and a status that changes no behaviour enforces nothing. Raw candidates sit in Backlog with the `research` label.
 
 ## Routing
 

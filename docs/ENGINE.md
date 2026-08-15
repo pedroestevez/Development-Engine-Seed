@@ -47,15 +47,27 @@ A subagent file is a **role**, not a worker. The orchestrator spins up as many c
 
 ## 3. The work pipeline — Linear statuses
 
-**Triage → Backlog → Ready → In Progress → Done.** Every arrow is an automated pass except one: the Direction gate sits at **cycle admission**, not backlog entry.
+**Backlog → Ready → In Progress → In Review → Done**, with **Parked** and **Needs Pedro** as the two off-ramps. Every arrow is an automated pass except one: the Direction gate sits at **cycle admission**, not backlog entry.
 
-1. **Triage** — Researcher/PO drop raw candidates here: title + evidence, **no spec** (cheap). The build loop **never reads Triage**.
-2. **→ Backlog** — light curation, **not a gate**: the Planner suggests promotions in its digest; Pedro bulk-accepts or **demotes** (falls back to Triage — never deleted). Backlog is a holding pool; nothing in it is a commitment to build.
-3. **→ Ready** — triggered by **cycle nomination**: when the Planner nominates Backlog issues for the next cycle, the Readiness/Spec pass enriches them (points, definition of done, risk labels, ambiguity removed) and **checks each is buildable**: testable done-state, dependencies resolved. Passes → **Ready**; fails → flagged to Pedro **now**, in planning, not at 2am mid-build. Speccing a nominee Pedro later rejects costs a few tokens — accepted, so approval is over **pointed, spec'd issues, not vibes**.
-4. **Cycle approval — the Direction gate.** The Planner composes the proposed cycle from Ready issues; the proposal reaches Pedro on the escalation channel (§12); **one tap approves**. No approved cycle → nothing runs (**fail closed**). Change of mind mid-cycle: pull an item and unstarted work never starts; in-flight work gets its PR **parked, not merged**. Merges happen only for issues still in the approved cycle at merge time.
-5. **→ In Progress → Done** — the build loop pulls **the approved cycle's Ready issues** only and runs them, with the review gate inside.
+> **These are the literal names of the statuses on the Aligncompass team's board.** A pipeline described here but absent from Linear is unrunnable — the dispatcher matches on status names, so a mismatch means it admits nothing, forever. Any change to this list is a change to the board, and vice versa.
+
+**A status earns its place only if the engine behaves differently for it.** That test is why there is no separate `Triage`: to the build loop, Triage and Backlog both mean *not admissible*, so a second status for it enforces nothing. Raw candidates go to Backlog carrying the `research` label; the Planner curates from there. Revisit only when researcher volume justifies Linear's native Triage inbox.
+
+1. **Backlog** — the holding pool. Raw candidates and groomed-but-uncommitted work both live here. The build loop **never reads Backlog**. Planner-suggested promotion out of it is curation, **not a gate**; nothing in it is a commitment to build.
+2. **→ Ready** — triggered by **cycle nomination**: when the Planner nominates Backlog issues for the next cycle, the Readiness/Spec pass enriches them (points, definition of done, risk labels, ambiguity removed) and **checks each is buildable** against the seven gate questions in `spec.md` — including that `weighted_cost ≤ run budget`, because an issue too large for one run is by definition not Ready. Passes → **Ready**; fails → **Needs Pedro** *now*, in planning, not at 2am mid-build. Speccing a nominee Pedro later rejects costs a few tokens — accepted, so approval is over **pointed, spec'd issues, not vibes**.
+3. **Cycle approval — the Direction gate.** The Planner composes the proposed cycle from Ready issues; the proposal reaches Pedro on the escalation channel (§12); **one tap approves**. No approved cycle → nothing runs (**fail closed**). Change of mind mid-cycle: pull an item and unstarted work never starts; in-flight work gets its PR **parked, not merged**. Merges happen only for issues still in the approved cycle at merge time.
+4. **→ In Progress → In Review → Done** — the build loop pulls **the approved cycle's Ready issues** only and runs them, with the review gate inside. `In Review` means the PR is open and awaiting the reviewer, the blind test-author, and (on risk-labelled issues) the security pass.
+
+### The two off-ramps
+
+- **Parked** *(started)* — work a run's backstop interrupted. An artifact always exists: a preserved worktree and an open draft PR. **No human decision is required** — it simply needs another run, and the next run drains Parked *before* admitting anything new against the budget, since finishing sunk work is strictly cheaper than starting fresh.
+- **Needs Pedro** *(unstarted)* — work blocked on a **decision**: an unresolved ambiguity, a failed readiness check, a gate hit. Excluded from every run until Pedro answers.
+
+Keeping these distinct is what keeps the escalation queue worth reading. Parked work in "Needs Pedro" would fill it with items Pedro cannot act on.
 
 **"Ready" means "won't stall."** The mid-sprint pause is an *unreadiness* symptom — cured by gating readiness upstream, not by hoping the build doesn't stall.
+
+**No issue ever ends a run in "In Progress".** After any run, every issue it touched is in exactly one of: `In Review` (PR open), `Parked` (artifact preserved), or `Needs Pedro` (decision required) — plus those never admitted, which stay `Ready` with a logged deferral reason. "In Progress with nothing behind it" is the state that rots silently, so it is asserted against rather than merely discouraged.
 
 ---
 
