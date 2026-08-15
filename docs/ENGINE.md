@@ -49,7 +49,7 @@ A subagent file is a **role**, not a worker. The orchestrator spins up as many c
 
 **Backlog → Ready → In Progress → In Review → Done**, with **Parked** and **Needs Pedro** as the two off-ramps. Every arrow is an automated pass except one: the Direction gate sits at **cycle admission**, not backlog entry.
 
-> **These are the literal names of the statuses on the Aligncompass team's board.** A pipeline described here but absent from Linear is unrunnable — the dispatcher matches on status names, so a mismatch means it admits nothing, forever. Any change to this list is a change to the board, and vice versa.
+> **These must be the literal status names on the product's Linear team board.** A pipeline described here but absent from Linear is unrunnable — the dispatcher matches on status names, so a mismatch means it admits nothing, forever. Any change to this list is a change to the board, and vice versa. When cloning this seed into a new product, creating these statuses is step one.
 
 **A status earns its place only if the engine behaves differently for it.** That test is why there is no separate `Triage`: to the build loop, Triage and Backlog both mean *not admissible*, so a second status for it enforces nothing. Raw candidates go to Backlog carrying the `research` label; the Planner curates from there. Revisit only when researcher volume justifies Linear's native Triage inbox.
 
