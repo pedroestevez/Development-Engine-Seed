@@ -54,14 +54,14 @@ A subagent file is a **role**, not a worker. The orchestrator spins up as many c
 **A status earns its place only if the engine behaves differently for it.** That test is why there is no separate `Triage`: to the build loop, Triage and Backlog both mean *not admissible*, so a second status for it enforces nothing. Raw candidates go to Backlog carrying the `research` label; the Planner curates from there. Revisit only when researcher volume justifies Linear's native Triage inbox.
 
 1. **Backlog** — the holding pool. Raw candidates and groomed-but-uncommitted work both live here. The build loop **never reads Backlog**. Planner-suggested promotion out of it is curation, **not a gate**; nothing in it is a commitment to build.
-2. **→ Ready** — triggered by **cycle nomination**: when the Planner nominates Backlog issues for the next cycle, the Readiness/Spec pass enriches them (points, definition of done, risk labels, ambiguity removed) and **checks each is buildable** against the seven gate questions in `spec.md` — including that `weighted_cost ≤ run budget`, because an issue too large for one run is by definition not Ready. Passes → **Ready**; fails → **Needs Pedro** *now*, in planning, not at 2am mid-build. Speccing a nominee Pedro later rejects costs a few tokens — accepted, so approval is over **pointed, spec'd issues, not vibes**.
+2. **→ Ready** — triggered by **cycle nomination**: when the Planner nominates Backlog issues for the next cycle, the Readiness/Spec pass enriches them (points, definition of done, risk labels, ambiguity removed) and **checks each is buildable** against the seven gate questions in `spec.md` — including that `weighted_cost ≤ run budget`, because an issue too large for one run is by definition not Ready. Passes → **Ready**; fails → **Needs Pedro** *now*, in planning, not at 2am mid-build. **Human-action issues** — reversibility class `human-action`, executable only by Pedro — are exempt from the estimate and budget gates, are never estimated, and go to **Needs Pedro** rather than counting as readiness failures. Speccing a nominee Pedro later rejects costs a few tokens — accepted, so approval is over **pointed, spec'd issues, not vibes**.
 3. **Cycle approval — the Direction gate.** The Planner composes the proposed cycle from Ready issues; the proposal reaches Pedro on the escalation channel (§12); **one tap approves**. No approved cycle → nothing runs (**fail closed**). Change of mind mid-cycle: pull an item and unstarted work never starts; in-flight work gets its PR **parked, not merged**. Merges happen only for issues still in the approved cycle at merge time.
 4. **→ In Progress → In Review → Done** — the build loop pulls **the approved cycle's Ready issues** only and runs them, with the review gate inside. `In Review` means the PR is open and awaiting the reviewer, the blind test-author, and (on risk-labelled issues) the security pass.
 
 ### The two off-ramps
 
 - **Parked** *(started)* — work a run's backstop interrupted. An artifact always exists: a preserved worktree and an open draft PR. **No human decision is required** — it simply needs another run, and the next run drains Parked *before* admitting anything new against the budget, since finishing sunk work is strictly cheaper than starting fresh.
-- **Needs Pedro** *(unstarted)* — work blocked on a **decision**: an unresolved ambiguity, a failed readiness check, a gate hit. Excluded from every run until Pedro answers.
+- **Needs Pedro** *(unstarted)* — work blocked on a **decision**: an unresolved ambiguity, a failed readiness check, a gate hit — or a **human action** only Pedro can perform. Excluded from every run until Pedro answers.
 
 Keeping these distinct is what keeps the escalation queue worth reading. Parked work in "Needs Pedro" would fill it with items Pedro cannot act on.
 
@@ -82,6 +82,8 @@ Each field drives exactly one decision; never overload one number.
   - **`critical`** — manual override for danger an area label doesn't capture (tenant-isolation logic, webhook signature verification).
 
 **Model selection: `model = max(points-tier, risk-tier)`.** A 1-point payments task still routes to **Opus**, runs the **security pass**, and gets **stricter acceptance criteria**. Risk floors behavior **up** — that's how "needs more care" is encoded, as gates, not an inflated point value. (Area labels double as the Planner's file-overlap signal, so one label set serves both risk routing and batching.)
+
+Risk also **prices** the work: `weighted_cost = points × (any danger label ? 2.0 : 1.0)`, checked against the run budget at refinement (§3, `spec.md`). **Human-action issues carry neither points nor risk labels** — they never route to a model; they live in `Needs Pedro`.
 
 ---
 
@@ -194,7 +196,9 @@ development-engine-seed/
 │   │   ├── researcher.md        (Sonnet — discovery with evidence)
 │   │   ├── scribe.md            (Haiku — docs/changelog/retro transcription)
 │   │   └── security.md          (Opus — conditional risk pass)
-│   └── skills/                  (best-practice build skills)
+│   ├── skills/                  (best-practice build skills)
+│   └── templates/
+│       └── issue-body.md        (the issue shape the readiness gate checks)
 ├── docs/
 │   ├── ENGINE.md                (this document — source of truth)
 │   └── OPERATING-RULES.md       (north star + the two-gate rule)
