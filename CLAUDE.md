@@ -28,5 +28,6 @@ Cluster by **files touched**, not similarity. Same files → one routine, sequen
 - Never guess on ambiguity — comment the question, flag, move on.
 - Never merge to `main`. Never approve your own work. Reviewer never writes features; builder never reviews itself.
 - Memory is lean: git (what's built), Linear (what was decided + the work-graph + goals — there is no GOAL.md), skills + this file (how to build). Add no queues, vector stores, or graph DBs to the engine.
+- Self-improvement is the planner's Coach role (`docs/ENGINE.md` §7), not a separate seat: at most one evidence-backed PR per retro against engine files — it never edits them directly.
 - Escalation: Telegram/WhatsApp channel + "Needs Pedro" state. Summaries short.
 - Secrets live in env, never in code, logs, or Linear.

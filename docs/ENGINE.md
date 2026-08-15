@@ -35,7 +35,7 @@ A subagent file is a **role**, not a worker. The orchestrator spins up as many c
 | **Spec / BA** | Opus | Turns a promoted issue into **acceptance criteria + story points + risk labels**; runs the readiness check. The judgment seat. | Linear (issue body) |
 | **Builder** | Sonnet | Implements the issue in its own git worktree; commits; opens the PR. | repo (branch/PR) |
 | **Reviewer** | Sonnet | Independent check: runs the CI gate + tests, diffs against the acceptance criteria, reports pass/fail with reasons. **Does not write the feature.** | Linear (comment), PR |
-| **Planner** | Sonnet | Retro, backlog grooming, next-cycle composition, file-overlap clustering. (Opus if you want sharper retros.) | Linear (cycle, retro doc) |
+| **Planner** | Sonnet | Retro, backlog grooming, next-cycle composition, file-overlap clustering, and **Coach** (§7: evidence-backed engine-PR proposals from the retro). (Opus if you want sharper retros.) | Linear (cycle, retro doc); engine PRs (repo) |
 | **Researcher** | Sonnet | Research-labeled issues / external unknowns; gathers + synthesizes **with evidence**; turns findings into spec'd issues. | Linear (Triage, docs) |
 | **Scribe** | Haiku | Mechanical writing: README/changelog/playbook sync, retro transcription. | repo, Linear |
 | **Explore** | Haiku | Read-only recon (Claude Code built-in): reads a large codebase in its own context, returns a summary. | nothing (read-only) |
@@ -108,7 +108,7 @@ A routine wraps a **loop, not an issue**: one run boots the orchestrator, which 
 
 - **Build (nightly).** Orchestrator pulls the **approved cycle's Ready** issues in priority + dependency order and runs each **Build → Review → log** (Spec already done upstream). Stops on: sprint empty, a gate hit (flag and move on), or nearing the usage window (logs a resume point). Morning result: a mostly-built sprint + a short summary.
 - **Readiness / Spec (on cycle nomination, before the Direction gate).** Enriches nominated issues to **Ready** or flags. Also available as a **by-hand skill** to pressure-test a single issue while validating a proposal.
-- **Plan (every 1–3 days).** Planner writes the retro + grooms + composes the next-cycle **proposal** (one-tap approval = the Direction gate); the **Coach** proposes engine PRs; the **PO/Researcher** proposes Triage candidates. Output: one digest for Pedro.
+- **Plan (every 1–3 days).** Planner writes the retro + grooms + composes the next-cycle **proposal** (one-tap approval = the Direction gate) + — from that same retro, wearing the **Coach** hat (§7) — proposes at most one engine PR; the **PO/Researcher** proposes Triage candidates. Output: one digest for Pedro.
 
 **Triggers:** scheduled; **on-demand API** (an HTTP POST from the phone to run the build loop *now*); minimal **GitHub events** (kept narrow — that's where accidental loops hide).
 
@@ -118,7 +118,7 @@ Routine budget is ample: nightly build + planning every few days is 1–2 runs/d
 
 ## 7. Self-improvement — the Coach
 
-The meta-loop is the one loop that can quietly eat the system, so it is **gated, never autonomous.** The Coach **edits nothing.** From the retro it opens a **PR against the agent/skill files** with evidence ("3 escalations on webhook ambiguity → here's a tighter criteria block"); Pedro merges or rejects (Amendment gate). It points the same PR + CI pipeline the engine already uses at the engine's *own definitions*.
+The meta-loop is the one loop that can quietly eat the system, so it is **gated, never autonomous.** The Coach is **not a separate seat** — it is a `planner.md` responsibility, triggered when that run's retro completes. It **edits nothing.** From the retro it opens **at most one PR per retro** against the agent/skill files (`.claude/**`, `CLAUDE.md`, `docs/ENGINE.md`), with evidence inline ("3 escalations on webhook ambiguity → here's a tighter criteria block"); Pedro merges or rejects (Amendment gate). It points the same PR + CI pipeline the engine already uses at the engine's *own definitions*.
 
 **Promotion to seed:** improvements useful beyond one product are promoted back to `development-engine-seed`, so the next clone starts smarter. Product repos pull engine updates when they choose. In-repo copies may evolve freely; the seed is how the engine compounds across products. The one discipline: promote broadly-useful improvements back.
 
@@ -192,7 +192,7 @@ development-engine-seed/
 │   │   ├── spec.md              (Opus — BA: criteria, points, risk labels, readiness)
 │   │   ├── builder.md           (Sonnet — implements in a worktree)
 │   │   ├── reviewer.md          (Sonnet — CI + criteria check, no writes)
-│   │   ├── planner.md           (Sonnet — retro, grooming, cycle composition)
+│   │   ├── planner.md           (Sonnet — retro, grooming, cycle composition, Coach)
 │   │   ├── researcher.md        (Sonnet — discovery with evidence)
 │   │   ├── scribe.md            (Haiku — docs/changelog/retro transcription)
 │   │   └── security.md          (Opus — conditional risk pass)
