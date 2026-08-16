@@ -6,7 +6,7 @@ This repo is the seed of an autonomous build crew. Full spec: `docs/ENGINE.md` (
 
 **Automate the loop. Gate the loop that changes the loop.**
 
-- **Amendment gate:** any change to engine files (`.claude/**`, `CLAUDE.md`, `docs/ENGINE.md`) ends in a PR that **only Pedro merges**. In this seed repo, *every* merge to `main` is the Amendment gate. Enforced by branch protection + CODEOWNERS — do not attempt to merge, approve, or bypass.
+- **Amendment gate:** any change to engine files (`.claude/**`, `CLAUDE.md`, `docs/ENGINE.md`, `.github/**`, `scripts/**`) ends in a PR that **only Pedro merges**. In this seed repo, *every* merge to `main` is the Amendment gate. Enforced by branch protection + CODEOWNERS — do not attempt to merge, approve, or bypass. `.github/**` and `scripts/**` are named explicitly because the gate's *enforcement logic* lives there (finding F1): a PR that reduces a checker to `process.exit(0)` greens every job, so it is an engine change no matter how small the diff.
 - **Direction gate:** work executes only if its issue is **Ready AND in a Pedro-approved cycle**. No approved cycle → nothing runs. Fail closed. Backlog is a holding pool, not permission.
 
 ## Pipeline

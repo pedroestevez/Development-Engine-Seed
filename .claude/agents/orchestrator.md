@@ -15,7 +15,7 @@ You are the run prompt for the development engine's build loop. You do not decid
 
 - Never decide model routing, admission, clustering, the stop reason, or the verdict for a candidate issue — those are `plan()`'s and `runDispatcher()`'s outputs (docs/ENGINE.md §4, §6), not yours to recompute or override by hand.
 - Never merge to `main`. Never approve your own work.
-- Never touch engine files (`.claude/**`, `CLAUDE.md`, `docs/ENGINE.md`) — this file included — outside an explicit engine issue; those PRs always require Pedro's review (Amendment gate, docs/ENGINE.md §16).
+- Never touch engine files (`.claude/**`, `CLAUDE.md`, `docs/ENGINE.md`, `.github/**`, `scripts/**`) — this file included — outside an explicit engine issue; those PRs always require Pedro's review (Amendment gate, docs/ENGINE.md §16). `.github/**` and `scripts/**` are engine files because the gate's executable logic lives there (finding F1), not merely its documentation.
 
 ## If the script itself needs to change
 

@@ -11,16 +11,44 @@
  * real heading in the target file (or the current file, for same-file
  * anchors).
  *
+ * Every path derived from file content is confined to the repository root
+ * before it is touched -- lexically, and again through symlinks (finding F3;
+ * see isInsideRepo below). A link that escapes the root is an error, not a
+ * skipped link.
+ *
  * No dependencies, no package.json required -- run directly with `node`.
  *
- * Exit code 0 = every relative link resolves. Exit code 1 = at least one
- * broken cross-reference, printed with file:line and the offending link.
+ * Exit code 0 = every relative link resolves inside the repo. Exit code 1 =
+ * at least one broken or escaping cross-reference, printed with file:line
+ * and the offending link.
  */
 
 const fs = require("fs");
 const path = require("path");
 
-const REPO_ROOT = path.resolve(__dirname, "..");
+// Canonical (symlink-resolved) repository root. Security-pass finding F3
+// requires the comparison base itself be a realpath: comparing a realpath'd
+// target against a non-canonical root would misjudge every path the moment
+// any ancestor directory of the checkout is a symlink.
+const REPO_ROOT = fs.realpathSync(path.resolve(__dirname, ".."));
+
+/**
+ * SECURITY -- finding F3 (ALI-100 security pass, comment 0d889e41).
+ *
+ * True iff `p` is the repository root or lives underneath it. Every
+ * filesystem path this script derives from *file content* -- i.e. from a
+ * markdown link, which any pull request can author -- must satisfy this
+ * before it is touched. Without it, `[x](../../../../etc/hostname)` passes:
+ * the gate then proves links resolve on the CI runner, not in the repo, and
+ * doubles as a one-bit read oracle over every runner-readable path.
+ *
+ * `p` must already be absolute and normalized (path.resolve does both).
+ * The `+ path.sep` is deliberate -- a bare startsWith(REPO_ROOT) would also
+ * accept a sibling directory whose name merely begins with the root's.
+ */
+function isInsideRepo(p) {
+  return p === REPO_ROOT || p.startsWith(REPO_ROOT + path.sep);
+}
 
 const GLOB_ROOTS = [
   { file: "CLAUDE.md" },
@@ -138,8 +166,45 @@ function checkFile(absPath, anchorCache, errors) {
 
     const targetAbs = path.resolve(path.dirname(absPath), decodeURIComponent(rawPath));
 
+    // F3 guard 1 of 2 -- LEXICAL, before the first filesystem call. A `../`
+    // chain that walks out of the root is rejected here, so `existsSync`
+    // never gets to answer a question about a path outside the repository.
+    // This is an ERROR (-> exit 1), never a silent `continue`: a gate that
+    // quietly skips the links it finds suspicious enforces nothing.
+    if (!isInsideRepo(targetAbs)) {
+      errors.push(
+        `${relPath}:${line}  link escapes the repository root -> ${target} (resolves to ${targetAbs}, outside ${REPO_ROOT})`
+      );
+      continue;
+    }
+
     if (!fs.existsSync(targetAbs)) {
       errors.push(`${relPath}:${line}  broken relative link -> ${target} (no such file: ${path.relative(REPO_ROOT, targetAbs)})`);
+      continue;
+    }
+
+    // F3 guard 2 of 2 -- SYMLINK, after existsSync has confirmed the target
+    // is real and before ANY read of it (statSync below, and readFileSync via
+    // headingAnchors). A committed in-repo symlink is inside the root
+    // lexically and outside it in fact, so guard 1 cannot see it -- and
+    // existsSync follows symlinks, so reaching here proves nothing about
+    // where the bytes actually live. Placed ahead of the `if (anchor)` block
+    // rather than inside it, so an unanchored link to an escaping symlink is
+    // caught too: the invariant is "no gate script reads outside the
+    // repository root", not "no anchored link does".
+    let targetReal;
+    try {
+      targetReal = fs.realpathSync(targetAbs);
+    } catch (err) {
+      errors.push(
+        `${relPath}:${line}  link target could not be canonicalized -> ${target} (${err.code || err.message})`
+      );
+      continue;
+    }
+    if (!isInsideRepo(targetReal)) {
+      errors.push(
+        `${relPath}:${line}  link escapes the repository root via symlink -> ${target} (${path.relative(REPO_ROOT, targetAbs)} resolves to ${targetReal}, outside ${REPO_ROOT}); target not read`
+      );
       continue;
     }
 
