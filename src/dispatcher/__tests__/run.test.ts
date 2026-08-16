@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   DEFAULT_BACKSTOP,
   runDispatcher,
+  runDispatcherAndPersist,
   runLogPath,
   type AgentDispatchResult,
   type AgentPort,
@@ -734,6 +735,102 @@ describe("criterion 10: no secret material in emitted artifacts", () => {
 
     expect(result.runLogJson).not.toContain("sk-abc123leaked");
     expect(result.runLogJson).toContain("[REDACTED]");
+  });
+
+  // AC10 names "the emitted `.engine/runs/<iso-timestamp>.json`" as the test
+  // target -- the scan above only ever inspected the in-memory string. This
+  // reads the file `runDispatcherAndPersist()` actually wrote back off disk,
+  // so the criterion is checked against the real artifact, not a stand-in.
+  it("the FILE actually written to .engine/runs/ (not just the in-memory string) contains no dummy credential values or known secret prefixes", async () => {
+    const tempDir = await fs.mkdtemp(join(tmpdir(), "ali103-runlog-secrets-"));
+    try {
+      const expensive = makeIssue("expensive", 5, { priority: 1 });
+      const { port: linear } = createFakeLinear({ readyIssues: [expensive] });
+      const credentials: RuntimeCredentials = { linearApiKey: DUMMY_LINEAR_KEY, githubToken: DUMMY_GITHUB_TOKEN };
+
+      const result = await runDispatcherAndPersist(makeConfig(), makeDeps({ linear, credentials }), tempDir);
+      const onDisk = await fs.readFile(result.runLogFilePath, "utf8");
+
+      expect(onDisk).not.toContain(DUMMY_LINEAR_KEY);
+      expect(onDisk).not.toContain(DUMMY_GITHUB_TOKEN);
+      for (const substring of SECRET_SUBSTRINGS) {
+        expect(onDisk).not.toContain(substring);
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reviewer finding #13: the run log is actually persisted to disk
+//
+// ALI-103 §5 says "Emit `.engine/runs/<iso-timestamp>.json`"; AC10 names
+// that emitted file as its own test target. `runDispatcher()` only ever
+// returned the JSON in memory -- these tests close that gap by exercising
+// `runDispatcherAndPersist()`, the thin wrapper that actually writes it.
+// ---------------------------------------------------------------------------
+
+describe("finding #13: runDispatcherAndPersist() actually writes .engine/runs/<iso-timestamp>.json", () => {
+  const tempDirs: string[] = [];
+
+  afterEach(async () => {
+    for (const dir of tempDirs.splice(0)) {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("writes the file at the computed path, byte-identical to the returned runLogJson", async () => {
+    const tempDir = await fs.mkdtemp(join(tmpdir(), "ali103-runlog-write-"));
+    tempDirs.push(tempDir);
+
+    const issue = makeIssue("persisted", 1);
+    const { port: linear } = createFakeLinear({ readyIssues: [issue] });
+    const clock = createFakeClock(1_755_302_400_000); // fixed, so generatedAt is deterministic
+
+    const result = await runDispatcherAndPersist(makeConfig(), makeDeps({ linear, clock }), tempDir);
+
+    const expectedPath = join(tempDir, runLogPath(result.runLog.generatedAt));
+    expect(result.runLogFilePath).toBe(expectedPath);
+
+    const onDisk = await fs.readFile(expectedPath, "utf8");
+    expect(onDisk).toBe(result.runLogJson);
+  });
+
+  it("still persists a record when the run stops at no-approved-cycle (the fail-closed audit trail)", async () => {
+    const tempDir = await fs.mkdtemp(join(tmpdir(), "ali103-runlog-no-cycle-"));
+    tempDirs.push(tempDir);
+
+    const { port: linear } = createFakeLinear({ approvedCycle: null });
+    const result = await runDispatcherAndPersist(makeConfig(), makeDeps({ linear }), tempDir);
+
+    const onDisk = await fs.readFile(result.runLogFilePath, "utf8");
+    expect(JSON.parse(onDisk).stopReason).toBe("no-approved-cycle");
+  });
+
+  it("still persists a record when the run stops at gate-hit (status-name drift)", async () => {
+    const tempDir = await fs.mkdtemp(join(tmpdir(), "ali103-runlog-gate-hit-"));
+    tempDirs.push(tempDir);
+
+    const { port: linear } = createFakeLinear({ workflowStatuses: ["Backlog", "Todo", "Done"] });
+    const result = await runDispatcherAndPersist(makeConfig(), makeDeps({ linear }), tempDir);
+
+    const onDisk = await fs.readFile(result.runLogFilePath, "utf8");
+    expect(JSON.parse(onDisk).stopReason).toBe("gate-hit");
+    expect(JSON.parse(onDisk).fatalError).toBeTruthy();
+  });
+
+  it("writes into a .engine/runs/ directory it creates itself", async () => {
+    const tempDir = await fs.mkdtemp(join(tmpdir(), "ali103-runlog-mkdir-"));
+    tempDirs.push(tempDir);
+    // Sanity: .engine/runs/ does not exist yet in this fresh temp dir.
+    await expect(fs.stat(join(tempDir, ".engine", "runs"))).rejects.toThrow();
+
+    const { port: linear } = createFakeLinear({ approvedCycle: null });
+    await runDispatcherAndPersist(makeConfig(), makeDeps({ linear }), tempDir);
+
+    const stat = await fs.stat(join(tempDir, ".engine", "runs"));
+    expect(stat.isDirectory()).toBe(true);
   });
 });
 

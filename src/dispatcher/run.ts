@@ -17,8 +17,16 @@
  * file's own logic — the run loop itself — is a deterministic function of
  * those ports' behavior, which is what makes criteria 1–7 testable without
  * network, real git, or real subprocesses (see `__tests__/run.test.ts`).
+ *
+ * One exception, by design: `runDispatcher()` itself never touches the
+ * filesystem, so the run-loop logic above keeps testing purely against
+ * fakes. `runDispatcherAndPersist()` is the thin wrapper around it that
+ * actually writes `.engine/runs/<iso-timestamp>.json` — the one real `node:fs`
+ * call in this file, isolated at the bottom on purpose.
  */
 
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { hasDangerLabel, plan, weightedCost } from "./plan.js";
 import type { DispatcherConfig, Issue, RunPlan } from "./types.js";
 import {
@@ -639,4 +647,43 @@ export async function runDispatcher(config: RuntimeConfig, deps: RunDeps): Promi
 /** `.engine/runs/<iso-timestamp>.json` -- the run log's file path, given its own `generatedAt`. */
 export function runLogPath(generatedAt: string): string {
   return `.engine/runs/${generatedAt}.json`;
+}
+
+/**
+ * Writes an already-scrubbed run-log JSON string to `<baseDir>/<runLogPath(generatedAt)>`,
+ * creating `.engine/runs/` if it doesn't exist yet. Returns the absolute
+ * path written. `baseDir` defaults to the process's cwd (the repo root, in
+ * production) and is overridden in tests to a throwaway temp directory.
+ */
+export async function writeRunLog(
+  runLogJson: string,
+  generatedAt: string,
+  baseDir: string = process.cwd(),
+): Promise<string> {
+  const absolutePath = join(baseDir, runLogPath(generatedAt));
+  await mkdir(dirname(absolutePath), { recursive: true });
+  await writeFile(absolutePath, runLogJson, "utf8");
+  return absolutePath;
+}
+
+/**
+ * Runs the dispatcher and persists its decision record to disk. This is the
+ * actual entry point a run invokes (`orchestrator.md`'s "invoke the
+ * dispatcher") -- `runDispatcher()` stays a pure function of its ports so
+ * the run-loop logic keeps testing without a real filesystem; this wrapper
+ * is the one place that writes the artifact spec §5 asks for.
+ *
+ * Persists on **every** completed run, regardless of `stop_reason` -- a
+ * `no-approved-cycle` or `gate-hit` run still emits its record, because
+ * that empty-looking record *is* the fail-closed audit trail (AC1/AC8):
+ * proof the run fired, checked, and correctly did nothing.
+ */
+export async function runDispatcherAndPersist(
+  config: RuntimeConfig,
+  deps: RunDeps,
+  baseDir: string = process.cwd(),
+): Promise<RunResult & { runLogFilePath: string }> {
+  const result = await runDispatcher(config, deps);
+  const runLogFilePath = await writeRunLog(result.runLogJson, result.runLog.generatedAt, baseDir);
+  return { ...result, runLogFilePath };
 }
