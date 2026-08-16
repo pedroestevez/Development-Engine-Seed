@@ -1,15 +1,17 @@
 /**
- * Dispatcher runtime — the worktree and GitHub ports.
+ * Dispatcher runtime — the worktree, engine-pin, and GitHub ports.
  *
- * Two related, git-shaped concerns share this file: creating/preserving the
- * one-worktree-per-cluster filesystem isolation (docs/ENGINE.md §5), and
- * pushing/opening the PR that makes a worktree's work visible outside it.
- * Both ports are given real adapters here — unlike `AgentPort` and
- * `LinearPort`, `WorktreePort`'s real implementation only needs local git
- * and the filesystem, so it can be both real *and* hermetically tested (no
- * network, no credentials) with an actual temp-dir git repo. `GitHubPort`
- * needs real network + credentials, so its real adapter is a thin stub —
- * same treatment as `LinearPort` (see that file's doc comment).
+ * Three related, git-shaped concerns share this file: creating/preserving
+ * the one-worktree-per-cluster filesystem isolation (docs/ENGINE.md §5),
+ * resolving and physically pinning the engine commit every agent this run
+ * spawns reads `.claude/**` from (ALI-104), and pushing/opening the PR that
+ * makes a worktree's work visible outside it. `WorktreePort` and
+ * `EnginePinPort` are given real adapters here — unlike `AgentPort` and
+ * `LinearPort`, both only need local git and the filesystem, so they can be
+ * both real *and* hermetically tested (no network, no credentials) with an
+ * actual temp-dir git repo. `GitHubPort` needs real network + credentials,
+ * so its real adapter is a thin stub — same treatment as `LinearPort` (see
+ * that file's doc comment).
  */
 
 import { execFile } from "node:child_process";
@@ -39,6 +41,34 @@ export interface WorktreePort {
   preserve(handle: WorktreeHandle): Promise<void>;
   /** Cleans up a worktree after a normal, successful completion. Never called on a kill path. */
   remove(handle: WorktreeHandle): Promise<void>;
+}
+
+/**
+ * Resolves and physically pins the engine commit every agent this run
+ * spawns reads its definition from (ALI-104). Two capabilities, deliberately
+ * kept on one port because both are the same git subprocess plumbing this
+ * file already owns:
+ *
+ *   - `resolveEngineSha` is the run's **sole** source of the pin — a
+ *     `git rev-parse HEAD` against the engine repo root, never a value any
+ *     caller (config, prompt) supplies (AC1).
+ *   - `createPinnedTree` turns that pin into a **read-only, detached**
+ *     checkout — a tree distinct from any mutable work worktree, so a
+ *     builder issue that legitimately edits `.claude/**` never mutates the
+ *     definitions the run itself is currently executing from (AC2). The
+ *     port exposes no write operation against this tree by design —
+ *     "read-only" is a property of the API surface, not a filesystem
+ *     permission bit.
+ */
+export interface EnginePinPort {
+  /** `git rev-parse HEAD` against the engine repo root — the physical pin. */
+  resolveEngineSha(): Promise<string>;
+  /**
+   * Creates exactly one detached checkout at `pin`. Returns its absolute
+   * path — the value every `DispatchContext.enginePath` carries for the
+   * rest of the run.
+   */
+  createPinnedTree(pin: string): Promise<string>;
 }
 
 export interface DraftPrParams {
@@ -85,6 +115,26 @@ export function createGitWorktreePort(repoRoot: string, worktreesDir: string): W
     },
     async remove(handle) {
       await execFileAsync("git", ["worktree", "remove", handle.path, "--force"], { cwd: repoRoot });
+    },
+  };
+}
+
+/**
+ * Real adapter for `EnginePinPort`: `git rev-parse HEAD` plus a detached
+ * `git worktree add` (no branch — nothing ever commits here). Hermetically
+ * testable against a throwaway git repo, same treatment as
+ * `createGitWorktreePort` above (see `__tests__/pinning.test.ts`).
+ */
+export function createGitEnginePinPort(repoRoot: string, pinnedTreesDir: string): EnginePinPort {
+  return {
+    async resolveEngineSha() {
+      const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repoRoot });
+      return stdout.trim();
+    },
+    async createPinnedTree(pin) {
+      const path = `${pinnedTreesDir}/${pin}`;
+      await execFileAsync("git", ["worktree", "add", "--detach", path, pin], { cwd: repoRoot });
+      return path;
     },
   };
 }

@@ -23,6 +23,7 @@ import { checkStatusDrift, statusDriftMessage, type CycleRef, type LinearIssue, 
 import {
   createGitWorktreePort,
   type DraftPrParams,
+  type EnginePinPort,
   type GitHubPort,
   type WorktreeHandle,
   type WorktreePort,
@@ -131,6 +132,30 @@ function createFakeWorktree(): { port: WorktreePort; state: FakeWorktreeState } 
   return { port, state };
 }
 
+// ALI-104: the pin -- a fake `EnginePinPort` returning a fixed SHA by
+// default, so existing fixtures (e.g. criterion 4's "abc1234" assertion
+// below) keep the same observable content without themselves knowing the
+// pin moved from a config field to an injected port.
+interface FakeEnginePinState {
+  resolveCalls: number;
+  createPinnedTreeCalls: string[];
+}
+
+function createFakeEnginePin(sha = "abc1234"): { port: EnginePinPort; state: FakeEnginePinState } {
+  const state: FakeEnginePinState = { resolveCalls: 0, createPinnedTreeCalls: [] };
+  const port: EnginePinPort = {
+    async resolveEngineSha() {
+      state.resolveCalls++;
+      return sha;
+    },
+    async createPinnedTree(pin) {
+      state.createPinnedTreeCalls.push(pin);
+      return `/fake/engine-pin/${pin}`;
+    },
+  };
+  return { port, state };
+}
+
 interface FakeGitHubState {
   pushed: { path: string; branch: string }[];
   prs: DraftPrParams[];
@@ -204,8 +229,11 @@ function makeConfig(overrides: Partial<RuntimeConfig> = {}): RuntimeConfig {
     // A soft/hard window wide enough that no fixture crosses it unless a
     // test deliberately advances the fake clock to trip it.
     backstop: overrides.backstop ?? { wallClockSoftMs: 1_000_000, wallClockHardMs: 2_000_000 },
-    engineSha: overrides.engineSha ?? "abc1234",
     baseRef: overrides.baseRef ?? "origin/main",
+    // ALI-104: no `engineSha` field -- the run resolves its own pin via
+    // `RunDeps.enginePin` (see `createFakeEnginePin` above), never a config
+    // input. `requiredPin` (engine-drift) stays unset by default here.
+    requiredPin: overrides.requiredPin,
   };
 }
 
@@ -213,6 +241,7 @@ function makeDeps(parts: {
   linear?: LinearPort;
   github?: GitHubPort;
   worktree?: WorktreePort;
+  enginePin?: EnginePinPort;
   agent?: AgentPort;
   clock?: Clock;
   credentials?: RuntimeCredentials;
@@ -221,6 +250,7 @@ function makeDeps(parts: {
     linear: parts.linear ?? createFakeLinear().port,
     github: parts.github ?? createFakeGitHub().port,
     worktree: parts.worktree ?? createFakeWorktree().port,
+    enginePin: parts.enginePin ?? createFakeEnginePin().port,
     agent: parts.agent ?? createFakeAgent().port,
     clock: parts.clock ?? createFakeClock(),
     credentials: parts.credentials ?? {},
@@ -569,11 +599,12 @@ describe("criterion 7: stop_reason is always one of the six enumerated values", 
     expect(result.runLog.stopReason).toBe("backstop-tokens");
   });
 
-  it("every stop_reason value produced above is a member of the enumerated six, never free text", () => {
+  it("every stop_reason value produced above is a member of the enumerated seven, never free text", () => {
     for (const value of STOP_REASONS) {
       expect(isStopReason(value)).toBe(true);
     }
-    expect(STOP_REASONS).toHaveLength(6);
+    // ALI-104 AC4: engine-drift is the seventh stop reason.
+    expect(STOP_REASONS).toHaveLength(7);
     expect(isStopReason("something-else")).toBe(false);
   });
 });
