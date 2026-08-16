@@ -172,6 +172,19 @@ export function redact(value: string | undefined | null): string {
 export type SeatName = "builder" | "blindQa" | "reviewer" | "security";
 
 /**
+ * Bounce round 1 (PR review), F6: the set of things that can *detect* a
+ * bounce — a superset of `SeatName`. Most bounces are caught by one of the
+ * four dispatch seats' own dispatch call, but a CI gate (the `gate-hit`
+ * `StopReason`, `run.ts`) can also reject a candidate without any seat
+ * reporting it. `"ci-gate"` gives that class a home in the schema now,
+ * while the schema is still unmerged, rather than after the first real gate
+ * bounce needs one. `SeatOutcome.seat` stays exactly `SeatName` — a gate is
+ * not a seat that runs, so it never appears there, only as a bounce's
+ * `detectorSeat`.
+ */
+export type BounceDetector = SeatName | "ci-gate";
+
+/**
  * ALI-106: the effort level a seat's model call actually ran at, distinct
  * from `model` (which *tier* ran). `"lint"` and `"judgment"` name the two
  * halves of the split-seat structure (mechanical check → cheap lint pass;
@@ -223,8 +236,8 @@ export type IssueOutcome = "opened-pr" | "parked" | "needs-pedro" | "not-dispatc
 export interface BounceRecord {
   round: number;
   detectedAtStage: BounceStage;
-  /** The seat whose dispatch call reported the rejection that triggered this bounce. */
-  detectorSeat: SeatName;
+  /** The seat (or `"ci-gate"`, F6) whose detection reported the rejection that triggered this bounce. */
+  detectorSeat: BounceDetector;
   /** Tokens the detecting pass itself consumed (the cost of *finding* the defect). */
   detectorTokens: number;
   /** Tokens the rework/rebuild that followed consumed (the cost of *fixing* it). */
@@ -381,6 +394,8 @@ export function renderCycleSummary(log: RunLog): string {
 
 const MODEL_TIERS = ["haiku", "sonnet", "opus"] as const;
 const SEAT_NAMES = ["builder", "blindQa", "reviewer", "security"] as const;
+/** F6: what a bounce's `detectorSeat` may hold — every real seat, plus `"ci-gate"` for a CI-gate-detected rejection. */
+const BOUNCE_DETECTORS = [...SEAT_NAMES, "ci-gate"] as const;
 const SEAT_EFFORTS = ["standard", "lint", "judgment"] as const;
 const BOUNCE_STAGES = ["lint", "judgment"] as const;
 
@@ -425,7 +440,7 @@ function validateBounceRecord(bounce: unknown, path: string, errors: string[]): 
   const b = bounce as Record<string, unknown>;
   if (!isNumber(b.round)) errors.push(`${path}.round: expected number`);
   if (!isOneOf(b.detectedAtStage, BOUNCE_STAGES)) errors.push(`${path}.detectedAtStage: expected one of ${BOUNCE_STAGES.join("|")}, got ${JSON.stringify(b.detectedAtStage)}`);
-  if (!isOneOf(b.detectorSeat, SEAT_NAMES)) errors.push(`${path}.detectorSeat: expected one of ${SEAT_NAMES.join("|")}, got ${JSON.stringify(b.detectorSeat)}`);
+  if (!isOneOf(b.detectorSeat, BOUNCE_DETECTORS)) errors.push(`${path}.detectorSeat: expected one of ${BOUNCE_DETECTORS.join("|")}, got ${JSON.stringify(b.detectorSeat)}`);
   if (!isNumber(b.detectorTokens)) errors.push(`${path}.detectorTokens: expected number`);
   if (!isNumber(b.reworkTokens)) errors.push(`${path}.reworkTokens: expected number`);
   if (!isString(b.reason)) errors.push(`${path}.reason: expected string`);

@@ -82,18 +82,32 @@ export function pointsToCostRatio(logs: readonly RunLog[]): PointsCostRatio[] {
 }
 
 /**
+ * F2 (bounce round 1): the minimum sample size a points bucket must carry
+ * before it may participate in the inconsistency check at all. Without this
+ * floor, a single unreplicated observation (`n=1`) could single-handedly
+ * decide AC4's lower-vs-re-point disambiguation — e.g. one 2pt candidate
+ * that happened to run expensive would flip the whole retro to "re-point"
+ * on no more evidence than a coincidence. A bucket below the floor is
+ * reported by the digest as not-yet-comparable rather than silently
+ * dropped, but never contributes a warning here.
+ */
+export const MIN_BUCKET_N_FOR_COMPARISON = 2;
+
+/**
  * "If a '3' reliably costs more than a '5', the scale is being applied
  * inconsistently" (the issue's own example). Flags every out-of-order pair
- * — a higher point value whose median cost is *lower* than a smaller point
- * value's — as a human-readable warning, so the retro can name the exact
- * pair rather than eyeball a table.
+ * — among buckets carrying at least `MIN_BUCKET_N_FOR_COMPARISON` samples
+ * (F2) — where a higher point value's median cost is *lower* than a
+ * smaller point value's, as a human-readable warning, so the retro can
+ * name the exact pair rather than eyeball a table.
  */
 export function detectPointsInconsistency(ratios: readonly PointsCostRatio[]): string[] {
   const warnings: string[] = [];
-  for (let i = 0; i < ratios.length; i++) {
-    for (let j = i + 1; j < ratios.length; j++) {
-      const smaller = ratios[i] as PointsCostRatio;
-      const larger = ratios[j] as PointsCostRatio;
+  const comparable = ratios.filter((r) => r.n >= MIN_BUCKET_N_FOR_COMPARISON);
+  for (let i = 0; i < comparable.length; i++) {
+    for (let j = i + 1; j < comparable.length; j++) {
+      const smaller = comparable[i] as PointsCostRatio;
+      const larger = comparable[j] as PointsCostRatio;
       if (smaller.medianTokens > larger.medianTokens) {
         warnings.push(
           `${smaller.points}pt issues cost more (median ${smaller.medianTokens} tokens, n=${smaller.n}) than ` +
@@ -115,7 +129,13 @@ export interface BackstopFireRate {
   totalRuns: number;
   backstopRuns: number;
   rate: number;
-  /** `rate < BACKSTOP_FIRE_RATE_TARGET` — the retro's own health check. */
+  /**
+   * F5 (bounce round 1): `rate <= BACKSTOP_FIRE_RATE_TARGET` — pinned to
+   * match the prose exactly ("Target: under 20%. **Above that**, …",
+   * docs/ENGINE.md §9): a rate of *exactly* 20% is the target, not above
+   * it, so it must not trigger the lower-or-re-point branch. Only a rate
+   * strictly greater than 20% is "OVER" / not `underTarget`.
+   */
   underTarget: boolean;
 }
 
@@ -126,7 +146,7 @@ export function computeBackstopFireRate(logs: readonly RunLog[]): BackstopFireRa
   const totalRuns = logs.length;
   const backstopRuns = logs.filter((l) => BACKSTOP_STOP_REASONS.has(l.stopReason)).length;
   const rate = totalRuns === 0 ? 0 : backstopRuns / totalRuns;
-  return { totalRuns, backstopRuns, rate, underTarget: rate < BACKSTOP_FIRE_RATE_TARGET };
+  return { totalRuns, backstopRuns, rate, underTarget: rate <= BACKSTOP_FIRE_RATE_TARGET };
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +158,30 @@ export function computeBackstopFireRate(logs: readonly RunLog[]): BackstopFireRa
  * admit; budget was never the limiting factor) and zero backstop fires.
  * `budget-exhausted` is deliberately excluded: that run used every point of
  * budget it had, the opposite of headroom.
+ *
+ * F4 (bounce round 1): the issue and docs/ENGINE.md §9 both phrase the ramp
+ * trigger as three runs "finishing **under budget**." This function reads
+ * that as `stopReason === "cycle-empty"` alone (plus zero backstop fires),
+ * without separately checking `budget.consumed < budget.total` — a
+ * deliberate, disclosed choice, not an oversight:
+ *
+ *   - `cycle-empty` already means the run stopped because the *cycle* ran
+ *     out of candidates to admit, not because the *budget* did — if the
+ *     budget had been the binding constraint, the stop reason would be
+ *     `budget-exhausted`, never `cycle-empty`. So `cycle-empty` is itself
+ *     the evidence that the budget wasn't binding on that run.
+ *   - A numeric `consumed < total` check is redundant with that and adds a
+ *     second, weaker way to read the same signal (e.g. a run that happens
+ *     to consume exactly 100% of budget on its last admitted candidate
+ *     while nothing was left to admit is still "budget wasn't limiting,"
+ *     not "budget was tight").
+ *
+ * `averageHeadroomFraction` (below) is reported by the digest and the
+ * `recommendBudgetChange` "hold" branch for visibility — a numeric sense of
+ * *how much* slack recent runs had — but is intentionally not part of this
+ * gate; the ramp decision is binary (clean or not), not headroom-sized.
+ * docs/ENGINE.md §9 states this reading explicitly so the code and the
+ * prose can't drift apart again.
  */
 export function isCleanRun(log: RunLog): boolean {
   return log.stopReason === "cycle-empty" && log.backstopFireCount === 0;
@@ -146,7 +190,11 @@ export function isCleanRun(log: RunLog): boolean {
 export interface BudgetHeadroom {
   /** Average fraction of budget consumed, across every run passed in. */
   averageConsumedFraction: number;
-  /** 1 - averageConsumedFraction. */
+  /**
+   * 1 - averageConsumedFraction. Reported for visibility (the digest, and
+   * the "hold" branch's evidence text) — see the F4 note on `isCleanRun`
+   * for why this does not itself gate the ramp trigger.
+   */
   averageHeadroomFraction: number;
   cleanRunCount: number;
   totalRuns: number;
@@ -286,6 +334,37 @@ function totalReworkTokens(bounces: RunLog["candidates"][number]["bounces"]): nu
 }
 
 /**
+ * F3 (bounce round 1): Hypothesis L's opus baseline, keyed by points bucket,
+ * built from the **whole issue's** `actualConsumption.tokensUsed` — every
+ * seat plus any rework, exactly the same quantity the ladder side of the
+ * comparison uses (see `evaluateHypothesisL` below). Deliberately *not*
+ * `builderSamplesByTierAndPoints`'s `builder.tokens` alone: that is a single
+ * seat's slice of the run, not "a single expensive run" (docs/ENGINE.md
+ * §9's own phrase for the falsification condition) — comparing a
+ * judgment-stage bounce's whole-issue cost against a stripped-down,
+ * builder-only baseline systematically understates the baseline and biases
+ * the test toward "falsified." A candidate qualifies as a baseline sample
+ * when its builder seat reported running at `opus` — same tier filter as
+ * before — but the cost taken from it is the issue's total, matching units
+ * on both sides of the `<` in the falsification check.
+ */
+function opusWholeIssueTokensByPoints(logs: readonly RunLog[]): Map<number, number[]> {
+  const byPoints = new Map<number, number[]>();
+  for (const log of logs) {
+    for (const candidate of log.candidates) {
+      const builder = candidate.seats.find((s: { seat: SeatName }) => s.seat === "builder");
+      if (!builder || builder.status !== "ran" || builder.model !== "opus") continue;
+      if (candidate.actualConsumption === undefined) continue;
+      const tokens = candidate.actualConsumption.tokensUsed;
+      const bucket = byPoints.get(candidate.points);
+      if (bucket) bucket.push(tokens);
+      else byPoints.set(candidate.points, [tokens]);
+    }
+  }
+  return byPoints;
+}
+
+/**
  * **Hypothesis T** — judgment at the gates, cheap builders downstream
  * (docs/ENGINE.md §9). Claim: a sharp spec plus a cheap builder beats a
  * vague spec plus an expensive one, because bounces dominate cost.
@@ -344,8 +423,18 @@ export function evaluateHypothesisT(logs: readonly RunLog[]): HypothesisReport {
  * Falsified if: ladder runs whose rejection was detected at judgment stage
  * nonetheless came out cheaper than a single expensive (opus) run. "Cheaper
  * than a single expensive run" is approximated as cheaper than the median
- * opus-tier builder cost in the same points bucket — the same baseline
- * Hypothesis T uses, for the same reason (no pricing table to do better).
+ * opus-tier **whole-issue** cost in the same points bucket (F3, bounce
+ * round 1: same units on both sides of the comparison — see
+ * `opusWholeIssueTokensByPoints`).
+ *
+ * F1 (bounce round 1, must-fix): a bounce whose candidate carries no
+ * `actualConsumption` has no known cost — `validateRunLogSchema` explicitly
+ * permits its absence, so this is real, expected input, not a malformed
+ * fixture. Such a bounce is excluded from the falsification set entirely
+ * (never defaulted to cost 0, which would make it read as the *cheapest*
+ * possible instance and falsely falsify the hypothesis) and is instead
+ * folded into the `n`/insufficient-data accounting: it counts toward
+ * neither `n` nor a verdict, the same as a bounce this module never saw.
  */
 export function evaluateHypothesisL(logs: readonly RunLog[]): HypothesisReport {
   const judgmentStageBounces = logs.flatMap((log) =>
@@ -355,34 +444,33 @@ export function evaluateHypothesisL(logs: readonly RunLog[]): HypothesisReport {
         .map((b) => ({ candidate: c, bounce: b })),
     ),
   );
-  const n = judgmentStageBounces.length;
+  // F1: only bounces whose candidate has a known actual cost are usable
+  // evidence. The rest are excluded from `n` and the falsification set,
+  // not defaulted to cost 0.
+  const costedBounces = judgmentStageBounces.filter(({ candidate }) => candidate.actualConsumption !== undefined);
+  const excludedForMissingCost = judgmentStageBounces.length - costedBounces.length;
+  const n = costedBounces.length;
 
   const opusMedianByPoints = new Map<number, number>();
-  for (const { cheap: _cheap, opus } of [builderSamplesByTierAndPoints(logs)]) {
-    void _cheap;
-    const byPoints = new Map<number, number[]>();
-    for (const s of opus) {
-      const bucket = byPoints.get(s.points);
-      if (bucket) bucket.push(s.tokens);
-      else byPoints.set(s.points, [s.tokens]);
-    }
-    for (const [points, tokens] of byPoints) {
-      opusMedianByPoints.set(points, median(tokens));
-    }
+  for (const [points, tokens] of opusWholeIssueTokensByPoints(logs)) {
+    opusMedianByPoints.set(points, median(tokens));
   }
 
   if (n < MIN_N_FOR_VERDICT || opusMedianByPoints.size === 0) {
     return {
       n,
       verdict: "insufficient data",
-      detail: `${n} judgment-stage bounce(s) found, ${opusMedianByPoints.size} points bucket(s) with an opus-tier baseline — need at least ${MIN_N_FOR_VERDICT} bounces and a baseline to compare against.`,
+      detail:
+        `${n} judgment-stage bounce(s) with a known actual cost found` +
+        (excludedForMissingCost > 0 ? ` (${excludedForMissingCost} more excluded — no actualConsumption recorded)` : "") +
+        `, ${opusMedianByPoints.size} points bucket(s) with an opus-tier whole-issue baseline — need at least ${MIN_N_FOR_VERDICT} costed bounces and a baseline to compare against.`,
     };
   }
 
-  const falsifyingInstances = judgmentStageBounces.filter(({ candidate }) => {
+  const falsifyingInstances = costedBounces.filter(({ candidate }) => {
     const baseline = opusMedianByPoints.get(candidate.points);
     if (baseline === undefined) return false;
-    const totalCost = (candidate.actualConsumption?.tokensUsed ?? 0);
+    const totalCost = (candidate.actualConsumption as { tokensUsed: number }).tokensUsed;
     return totalCost < baseline;
   });
 
@@ -390,7 +478,7 @@ export function evaluateHypothesisL(logs: readonly RunLog[]): HypothesisReport {
     return {
       n,
       verdict: "falsified",
-      detail: `${falsifyingInstances.length}/${n} judgment-stage-detected bounce(s) still cost less than their points bucket's opus-tier baseline.`,
+      detail: `${falsifyingInstances.length}/${n} judgment-stage-detected bounce(s) with known cost still cost less than their points bucket's opus-tier whole-issue baseline.`,
     };
   }
   return {
@@ -418,7 +506,10 @@ export function renderCalibrationDigest(logs: readonly RunLog[], currentBudget: 
   lines.push(`**Calibration digest — ${logs.length} run(s)**`);
   lines.push("");
   lines.push("Points-to-cost ratio (median actual tokens per point value):");
-  for (const r of ratios) lines.push(`- ${r.points}pt: median ${r.medianTokens} tokens (n=${r.n})`);
+  for (const r of ratios) {
+    const note = r.n < MIN_BUCKET_N_FOR_COMPARISON ? " — not yet comparable (fewer than 2 samples)" : "";
+    lines.push(`- ${r.points}pt: median ${r.medianTokens} tokens (n=${r.n})${note}`);
+  }
   for (const w of inconsistencies) lines.push(`  ⚠ ${w}`);
   lines.push("");
   lines.push(

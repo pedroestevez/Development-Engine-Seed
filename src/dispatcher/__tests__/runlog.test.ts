@@ -95,6 +95,14 @@ describe("ALI-106 AC1.1: validateRunLogSchema accepts a well-formed amended run 
     log.candidates[0]!.bounces = [];
     expect(validateRunLogSchema(log)).toEqual({ ok: true, errors: [] });
   });
+
+  it("accepts a bounce whose detectorSeat is 'ci-gate' -- a CI-gate-detected rejection, not a seat's own dispatch call (F6, bounce round 1)", () => {
+    const log = wellFormedRunLog();
+    log.candidates[0]!.bounces = [
+      { round: 1, detectedAtStage: "judgment", detectorSeat: "ci-gate", detectorTokens: 0, reworkTokens: 50, reason: "CI gate rejected: lint check failed" },
+    ];
+    expect(validateRunLogSchema(log)).toEqual({ ok: true, errors: [] });
+  });
 });
 
 describe("ALI-106 AC1.1: validateRunLogSchema rejects a log that regresses to the pre-amendment shape", () => {
@@ -132,6 +140,15 @@ describe("ALI-106 AC1.1: validateRunLogSchema rejects a log that regresses to th
     const result = validateRunLogSchema(log);
     expect(result.ok).toBe(false);
     expect(result.errors.some((e) => e.includes("detectedAtStage"))).toBe(true);
+  });
+
+  it("still rejects a bounce detectorSeat outside SeatName | 'ci-gate' (F6)", () => {
+    const log = wellFormedRunLog();
+    const bounce = log.candidates[0]!.bounces[0] as unknown as Record<string, unknown>;
+    bounce.detectorSeat = "not-a-real-detector";
+    const result = validateRunLogSchema(log);
+    expect(result.ok).toBe(false);
+    expect(result.errors.some((e) => e.includes("detectorSeat"))).toBe(true);
   });
 
   it("rejects a seat outcome with an unrecognized model value", () => {
