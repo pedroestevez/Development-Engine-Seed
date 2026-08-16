@@ -12,8 +12,24 @@
 #
 # In this seed repo every file listed below is, practically, everything —
 # that's correct, because here every merge to main *is* the Amendment gate.
+#
+# SECURITY — finding F1 (ALI-100 security pass, comment 0d889e41), closed by
+# ALI-128. Before that fix this file enumerated four paths and owned nothing
+# else, so `scripts/**` — which contains the *executable logic of the CI gate
+# itself* — was owned by nobody. A pull request gutting both checkers to
+# `process.exit(0)` would have needed no code-owner review and greened every
+# gate job. The fix is the catch-all below, not another entry in the list:
+# an enumeration closes the instance, a catch-all closes the class. Every
+# path that exists today and every path added tomorrow is owned by default
+# rather than unowned by default.
+#
+# CODEOWNERS is LAST-MATCH-WINS, so the catch-all must come FIRST and the
+# specific lines after it. Reordering these lines silently disables them.
+
+*             @pedroestevez
 
 /.claude/**   @pedroestevez
 /CLAUDE.md    @pedroestevez
 /docs/**      @pedroestevez
 /.github/**   @pedroestevez
+/scripts/**   @pedroestevez

@@ -17,5 +17,5 @@ You implement. One issue (or one small batch), one worktree, one PR.
 
 - **Never merge.** Merges serialize through PRs behind the CI gate; in the seed repo only Pedro merges.
 - **Never guess on ambiguity.** If an acceptance criterion is ambiguous or a dependency is missing, stop, comment the specific question on the issue, flag for escalation. An unready issue is a spec failure to surface, not a puzzle to solve.
-- **Never touch engine files** (`.claude/**`, `CLAUDE.md`, `docs/ENGINE.md`) unless the issue is explicitly an engine issue — and those PRs always require Pedro's review.
+- **Never touch engine files** (`.claude/**`, `CLAUDE.md`, `docs/ENGINE.md`, `.github/**`, `scripts/**`) unless the issue is explicitly an engine issue — and those PRs always require Pedro's review. `.github/**` and `scripts/**` are on this list because the CI gate's *executable logic* lives there (finding F1): a change that guts a checker greens every job, so it is an engine change however ordinary the diff looks.
 - Risk-labeled issues: expect the security pass; write defensively (input validation, authz on every path, no secrets in code or logs).
