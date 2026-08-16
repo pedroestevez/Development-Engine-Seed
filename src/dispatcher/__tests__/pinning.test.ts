@@ -17,7 +17,16 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { runDispatcher, type AgentDispatchResult, type Clock, type DispatchContext, type RunDeps, type RuntimeConfig } from "../run.js";
+import {
+  runDispatcher,
+  type AgentDispatchResult,
+  type BlindDispatchContext,
+  type BlindQaDispatchResult,
+  type Clock,
+  type DispatchContext,
+  type RunDeps,
+  type RuntimeConfig,
+} from "../run.js";
 import {
   createGitEnginePinPort,
   type DraftPrParams,
@@ -38,7 +47,34 @@ const execFileAsync = promisify(execFile);
 // per-file fixture convention).
 // ---------------------------------------------------------------------------
 
-function makeIssue(id: string, points: number, extra: Partial<Issue> = {}): LinearIssue {
+// ALI-105: a body carrying all three sections the blind seat reads, so this
+// file's fixtures dispatch blindQa for real by default rather than hitting
+// the unparseable-criteria skip -- this file's own tests are about the
+// engine pin, not blindQa, so its default behavior should stay out of the way.
+const FULL_BODY_FIXTURE = [
+  "## Why",
+  "",
+  "Fixture reasoning -- never handed to the blind seat.",
+  "",
+  "## What",
+  "",
+  "Fixture implementation sketch -- never handed to the blind seat.",
+  "",
+  "## Acceptance criteria",
+  "",
+  "1. It does the thing.",
+  "",
+  "## Invariant",
+  "",
+  "The thing always holds.",
+  "",
+  "## Definition of done",
+  "",
+  "Tests green.",
+  "",
+].join("\n");
+
+function makeIssue(id: string, points: number, extra: Partial<Issue> & { body?: string } = {}): LinearIssue {
   return {
     id,
     title: extra.title ?? `Issue ${id}`,
@@ -48,6 +84,7 @@ function makeIssue(id: string, points: number, extra: Partial<Issue> = {}): Line
     blockedBy: extra.blockedBy ?? [],
     predictedFiles: extra.predictedFiles ?? [],
     state: "Ready",
+    body: extra.body ?? FULL_BODY_FIXTURE,
   };
 }
 
@@ -159,13 +196,22 @@ type AgentScript = (seat: "builder" | "reviewer" | "security", ctx: DispatchCont
 
 function createFakeAgent(script?: AgentScript) {
   const calls: { seat: string; ctx: DispatchContext }[] = [];
+  const blindCalls: BlindDispatchContext[] = [];
   return {
     calls,
+    blindCalls,
     port: {
       async dispatch(seat: "builder" | "reviewer" | "security", ctx: DispatchContext) {
         calls.push({ seat, ctx });
         if (script) return script(seat, ctx);
         return { summary: `${seat} ok` };
+      },
+      // ALI-105: not under test in this file -- a no-op default is enough
+      // to satisfy `AgentPort` and let blindQa dispatch for real (see
+      // `FULL_BODY_FIXTURE` above) without any pinning test needing to care.
+      async dispatchBlindQa(ctx: BlindDispatchContext): Promise<BlindQaDispatchResult> {
+        blindCalls.push(ctx);
+        return { testFilesWritten: [], untestableCriteria: [] };
       },
     },
   };
