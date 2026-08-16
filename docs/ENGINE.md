@@ -31,7 +31,7 @@ A subagent file is a **role**, not a worker. The orchestrator spins up as many c
 
 | Role | Model | What it does | Writes to |
 |---|---|---|---|
-| **Orchestrator** | Opus | Coordinates one run: reads an issue, calls the chain, routes worker models, logs outcomes. Mechanical dispatch — **never originates work**. | Linear (comments/status) |
+| **Orchestrator** | *(none — deterministic script)* | Invokes the dispatcher (`src/dispatcher/run.ts`) for one run. Admission, clustering, model routing, the backstop, and the run log are pure functions, not inference — zero-token dispatch. `orchestrator.md` is the run prompt that calls it and reports; **never originates work**. | Linear (comments/status) |
 | **Spec / BA** | Opus | Turns a promoted issue into **acceptance criteria + story points + risk labels**; runs the readiness check. The judgment seat. | Linear (issue body) |
 | **Builder** | Sonnet | Implements the issue in its own git worktree; commits; opens the PR. | repo (branch/PR) |
 | **Reviewer** | Sonnet | Independent check: runs the CI gate + tests, diffs against the acceptance criteria, reports pass/fail with reasons. **Does not write the feature.** | Linear (comment), PR |
@@ -41,7 +41,7 @@ A subagent file is a **role**, not a worker. The orchestrator spins up as many c
 | **Explore** | Haiku | Read-only recon (Claude Code built-in): reads a large codebase in its own context, returns a summary. | nothing (read-only) |
 | **Security** | Opus | **Conditional pass** — runs only on risk-flagged issues. Reviews payments/auth/RLS/migrations/secrets; reports findings, doesn't rewrite. | Linear (comment), PR |
 
-**Why the tiers:** Opus where judgment lives (coordination, decomposition, security). Sonnet for code that must compile and pass review. Haiku only for mechanical search and transcription — never feature code. A great BA lowers *ambiguity*, not the intrinsic difficulty of writing correct code, so it can't make a Haiku builder safe.
+**Why the tiers:** Opus where judgment lives (decomposition, security) — *not* coordination, which is deterministic dispatch and costs zero tokens (§6, §17). Sonnet for code that must compile and pass review. Haiku only for mechanical search and transcription — never feature code. A great BA lowers *ambiguity*, not the intrinsic difficulty of writing correct code, so it can't make a Haiku builder safe.
 
 ---
 
@@ -188,7 +188,7 @@ The line is **which credential makes the model call.**
 development-engine-seed/
 ├── .claude/
 │   ├── agents/
-│   │   ├── orchestrator.md      (Opus — routing table + the two gates)
+│   │   ├── orchestrator.md      (no model — run prompt; invokes src/dispatcher/run.ts)
 │   │   ├── spec.md              (Opus — BA: criteria, points, risk labels, readiness)
 │   │   ├── builder.md           (Sonnet — implements in a worktree)
 │   │   ├── reviewer.md          (Sonnet — CI + criteria check, no writes)

@@ -49,7 +49,7 @@ jobs:
         run: node scripts/check-roster-consistency.js
 
   dispatcher-tests:
-    name: Dispatcher unit tests (placeholder)
+    name: Dispatcher unit tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,11 +58,12 @@ jobs:
         with:
           node-version: "22"
 
-      # The dispatcher (docs/ENGINE.md §17) hasn't landed yet -- no
-      # package.json exists in this repo. Once it does, this step starts
-      # actually running `npm test` and becomes a real gate instead of a
-      # no-op success. Until then it must succeed, not skip, so the job
-      # stays green and doesn't block PRs on work that isn't scoped yet.
+      # The dispatcher landed in ALI-102/ALI-103, so package.json and the
+      # vitest suite (src/dispatcher/__tests__/) now exist: this step runs
+      # `npm ci && npm test` and is a real gate, not a no-op success. The
+      # guard stays because this seed is templated into product clones
+      # (§14) that may have no dispatcher yet -- there it must succeed,
+      # not skip, so the job stays green.
       - name: Run dispatcher tests if present
         run: |
           if [ -f package.json ]; then
