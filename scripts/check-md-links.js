@@ -11,10 +11,15 @@
  * real heading in the target file (or the current file, for same-file
  * anchors).
  *
- * Every path derived from file content is confined to the repository root
- * before it is touched -- lexically, and again through symlinks (finding F3;
- * see isInsideRepo below). A link that escapes the root is an error, not a
- * skipped link.
+ * Every path this script touches is confined to the repository root before it
+ * is touched -- lexically, and again through symlinks (see isInsideRepo
+ * below). That covers both halves of the invariant:
+ *
+ *   * paths derived from *file content* -- markdown link targets (finding F3);
+ *   * the script's own *scan roots* -- the four fixed names it opens on its
+ *     own initiative, before any link has been parsed (finding S1).
+ *
+ * A path that escapes the root is an error, never a skipped path.
  *
  * No dependencies, no package.json required -- run directly with `node`.
  *
@@ -57,13 +62,96 @@ const GLOB_ROOTS = [
   { dir: ".claude", pattern: /\.md$/, recursive: true },
 ];
 
-/** Recursively collect markdown files under a directory. */
-function collectMarkdownFiles(absDir, pattern, recursive, out) {
-  if (!fs.existsSync(absDir)) return out;
+/**
+ * SECURITY -- finding S1 (ALI-128 security pass, PR #16).
+ *
+ * Confine a SCAN ROOT. The F3 guards in checkFile() cover paths parsed out of
+ * markdown; they are never reached by the path that decides *which files the
+ * checker opens in the first place*. Each of the four GLOB_ROOTS names is a
+ * path a pull request can replace with a symlink, so `CLAUDE.md`, `README.md`,
+ * `docs/` and `.claude/` are as attacker-reachable as any link target.
+ *
+ * Returns the confined absolute path, or null if there is nothing to scan.
+ *
+ * A root that exists but escapes is an ERROR (-> exit 1), NOT a silent skip.
+ * That choice is deliberate and is the whole point of the fix: skipping would
+ * be a false pass in the literal sense -- a PR that replaces `.claude` with a
+ * symlink would make the gate print "OK: every relative cross-reference
+ * resolves" having examined none of the agent roster. A gate the gated change
+ * can silence enforces nothing, so this takes the same call guards 1 and 2
+ * already take for links: name it and fail.
+ *
+ * An ABSENT root stays a silent skip. That is pre-existing, intended
+ * behaviour (a repo need not have a README), and unlike an escaping root it
+ * reveals nothing about the filesystem outside the checkout.
+ *
+ * Existence is decided with lstatSync, never existsSync: existsSync follows
+ * symlinks, so it would answer a question about the external target before
+ * any confinement check ran. The two escaping outcomes -- resolves outside,
+ * or does not resolve at all -- deliberately share one identical, target-free
+ * message, so a red build leaks no bit about what lives out there.
+ */
+function resolveScanRoot(relName, errors) {
+  const abs = path.join(REPO_ROOT, relName);
+  const escaped = `scan root "${relName}" exists but does not resolve to a path inside the repository root; refusing to scan it`;
+
+  try {
+    fs.lstatSync(abs); // does NOT follow symlinks -- cannot stat outside.
+  } catch (err) {
+    if (err.code === "ENOENT") return null; // absent: nothing to scan.
+    errors.push(`scan root "${relName}" could not be examined (${err.code || err.message})`);
+    return null;
+  }
+
+  let real;
+  try {
+    real = fs.realpathSync(abs);
+  } catch (err) {
+    errors.push(escaped); // e.g. a dangling symlink -- same message, no oracle.
+    return null;
+  }
+  if (!isInsideRepo(real)) {
+    errors.push(escaped);
+    return null;
+  }
+  return abs;
+}
+
+/**
+ * Recursively collect markdown files under a directory.
+ *
+ * S1: every directory the walk enters is confined on entry -- the initial
+ * scan root (already checked by resolveScanRoot; re-checked here so this
+ * function holds its own invariant rather than inheriting one from its
+ * caller) and every recursion step. Without it, `docs` -> `/` turns this walk
+ * into a filesystem crawl bounded only by the job's timeout-minutes.
+ *
+ * Note: entries that are themselves symlinks are neither descended into nor
+ * collected -- Dirent reports the link's own type, not its target's, so
+ * isDirectory()/isFile() are both false for one. They cannot pull the walk
+ * outside the root; they are simply not scanned.
+ */
+function collectMarkdownFiles(absDir, pattern, recursive, out, errors) {
+  let realDir;
+  try {
+    realDir = fs.realpathSync(absDir);
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      errors.push(`directory "${path.relative(REPO_ROOT, absDir)}" could not be examined (${err.code || err.message})`);
+    }
+    return out;
+  }
+  if (!isInsideRepo(realDir)) {
+    errors.push(
+      `directory "${path.relative(REPO_ROOT, absDir)}" does not resolve to a path inside the repository root; refusing to scan it`
+    );
+    return out;
+  }
+
   for (const entry of fs.readdirSync(absDir, { withFileTypes: true })) {
     const abs = path.join(absDir, entry.name);
     if (entry.isDirectory()) {
-      if (recursive) collectMarkdownFiles(abs, pattern, recursive, out);
+      if (recursive) collectMarkdownFiles(abs, pattern, recursive, out, errors);
       continue;
     }
     if (entry.isFile() && pattern.test(entry.name)) out.push(abs);
@@ -71,19 +159,15 @@ function collectMarkdownFiles(absDir, pattern, recursive, out) {
   return out;
 }
 
-function findTargetFiles() {
+function findTargetFiles(errors) {
   const files = [];
   for (const root of GLOB_ROOTS) {
     if (root.file) {
-      const abs = path.join(REPO_ROOT, root.file);
-      if (fs.existsSync(abs)) files.push(abs);
+      const abs = resolveScanRoot(root.file, errors);
+      if (abs) files.push(abs);
     } else {
-      collectMarkdownFiles(
-        path.join(REPO_ROOT, root.dir),
-        root.pattern,
-        !!root.recursive,
-        files
-      );
+      const abs = resolveScanRoot(root.dir, errors);
+      if (abs) collectMarkdownFiles(abs, root.pattern, !!root.recursive, files, errors);
     }
   }
   // De-dupe (in case globs overlap).
@@ -143,6 +227,25 @@ function isExternal(target) {
   return /^([a-z][a-z0-9+.-]*:)?\/\//i.test(target) || /^mailto:/i.test(target);
 }
 
+/**
+ * decodeURIComponent that cannot take the whole scan down -- finding S4
+ * (ALI-128 security pass, PR #16). A malformed escape (`%zz`, or a legitimate
+ * stray `%` as in `docs/50%-plan.md`) threw URIError straight out of main(),
+ * aborting at the first bad link and leaving every later file unchecked -- a
+ * stack trace instead of a file:line message.
+ *
+ * Falling back to the raw literal is safe, not a bypass: both F3 guards run
+ * on whatever this returns, so an undecodable target is confined exactly like
+ * a decoded one, and it still has to resolve to a real in-repo file to pass.
+ */
+function safeDecodeURIComponent(s) {
+  try {
+    return decodeURIComponent(s);
+  } catch (err) {
+    return s;
+  }
+}
+
 function checkFile(absPath, anchorCache, errors) {
   const relPath = path.relative(REPO_ROOT, absPath);
   const links = extractLinks(absPath);
@@ -152,7 +255,7 @@ function checkFile(absPath, anchorCache, errors) {
     if (isExternal(target)) continue;
 
     const [rawPath, rawAnchor] = target.split("#");
-    const anchor = rawAnchor !== undefined ? decodeURIComponent(rawAnchor) : undefined;
+    const anchor = rawAnchor !== undefined ? safeDecodeURIComponent(rawAnchor) : undefined;
 
     // Same-file anchor: [text](#section)
     if (rawPath === "") {
@@ -164,7 +267,7 @@ function checkFile(absPath, anchorCache, errors) {
       continue;
     }
 
-    const targetAbs = path.resolve(path.dirname(absPath), decodeURIComponent(rawPath));
+    const targetAbs = path.resolve(path.dirname(absPath), safeDecodeURIComponent(rawPath));
 
     // F3 guard 1 of 2 -- LEXICAL, before the first filesystem call. A `../`
     // chain that walks out of the root is rejected here, so `existsSync`
@@ -178,32 +281,51 @@ function checkFile(absPath, anchorCache, errors) {
       continue;
     }
 
-    if (!fs.existsSync(targetAbs)) {
-      errors.push(`${relPath}:${line}  broken relative link -> ${target} (no such file: ${path.relative(REPO_ROOT, targetAbs)})`);
+    // Existence is decided with lstatSync, not existsSync -- finding S3
+    // (ALI-128 security pass, PR #16). existsSync FOLLOWS symlinks, so it
+    // answered a question about the external target before guard 2 ran, and
+    // the two outcomes printed different messages: a working one-bit
+    // existence oracle over any runner-readable path, one bit per red build.
+    // lstat only ever asks about the in-repo entry itself.
+    //
+    // Residual, deliberately left open rather than read as closed: a
+    // symlinked *directory component* mid-path (`docs/etcdir` -> `/etc`, link
+    // `etcdir/hostname`) is still traversed by lstat's own path walk before
+    // guard 2 fires. Guard 2 rejects it and no content is ever read, but the
+    // stat itself lands outside. Closing that needs the nearest existing
+    // ancestor canonicalized first; not taken here.
+    try {
+      fs.lstatSync(targetAbs);
+    } catch (err) {
+      if (err.code === "ENOENT") {
+        errors.push(`${relPath}:${line}  broken relative link -> ${target} (no such file: ${path.relative(REPO_ROOT, targetAbs)})`);
+      } else {
+        errors.push(`${relPath}:${line}  link target could not be examined -> ${target} (${err.code || err.message})`);
+      }
       continue;
     }
 
-    // F3 guard 2 of 2 -- SYMLINK, after existsSync has confirmed the target
-    // is real and before ANY read of it (statSync below, and readFileSync via
+    // F3 guard 2 of 2 -- SYMLINK, after lstat has confirmed the entry exists
+    // and before ANY read of it (statSync below, and readFileSync via
     // headingAnchors). A committed in-repo symlink is inside the root
-    // lexically and outside it in fact, so guard 1 cannot see it -- and
-    // existsSync follows symlinks, so reaching here proves nothing about
-    // where the bytes actually live. Placed ahead of the `if (anchor)` block
-    // rather than inside it, so an unanchored link to an escaping symlink is
-    // caught too: the invariant is "no gate script reads outside the
-    // repository root", not "no anchored link does".
-    let targetReal;
+    // lexically and outside it in fact, so guard 1 cannot see it. Placed
+    // ahead of the `if (anchor)` block rather than inside it, so an
+    // unanchored link to an escaping symlink is caught too: the invariant is
+    // "no gate script reads outside the repository root", not "no anchored
+    // link does".
+    //
+    // S3: the two escaping outcomes -- resolves outside, or does not resolve
+    // at all (dangling) -- share one identical message that names the in-repo
+    // link but never echoes the external path it landed on.
+    let targetReal = null;
     try {
       targetReal = fs.realpathSync(targetAbs);
     } catch (err) {
-      errors.push(
-        `${relPath}:${line}  link target could not be canonicalized -> ${target} (${err.code || err.message})`
-      );
-      continue;
+      targetReal = null;
     }
-    if (!isInsideRepo(targetReal)) {
+    if (targetReal === null || !isInsideRepo(targetReal)) {
       errors.push(
-        `${relPath}:${line}  link escapes the repository root via symlink -> ${target} (${path.relative(REPO_ROOT, targetAbs)} resolves to ${targetReal}, outside ${REPO_ROOT}); target not read`
+        `${relPath}:${line}  link escapes the repository root via symlink -> ${target} (${path.relative(REPO_ROOT, targetAbs)} does not resolve to a path inside the repository root); target not read`
       );
       continue;
     }
@@ -226,8 +348,10 @@ function checkFile(absPath, anchorCache, errors) {
 }
 
 function main() {
-  const files = findTargetFiles();
+  // S1: findTargetFiles reports into the same error list as the link checks --
+  // an escaping scan root fails the run exactly like an escaping link target.
   const errors = [];
+  const files = findTargetFiles(errors);
   const anchorCache = new Map();
 
   for (const absPath of files) {
@@ -240,7 +364,9 @@ function main() {
 
   if (errors.length > 0) {
     console.log("");
-    console.error(`FAIL: ${errors.length} broken cross-reference(s):\n`);
+    // S1 widened this list past link targets (an unscannable scan root lands
+    // here too), so the heading no longer claims every entry is a link.
+    console.error(`FAIL: ${errors.length} error(s):\n`);
     for (const e of errors) console.error(`  ${e}`);
     process.exit(1);
   }

@@ -18,20 +18,35 @@ permissions:
 # also the accepted mitigation for the ReDoS surface in check-md-links.js's
 # heading regex (cap the job, do not rewrite the regex).
 #
-# The push-to-main exception is LOAD-BEARING, not stylistic. `cancel-in-progress`
-# is true for pull_request runs only:
+# The push-to-main exception is LOAD-BEARING, not stylistic. The property being
+# defended is: no commit on main ever ends up with no completed gate verdict.
 #
-#   * Superseded PR runs are safe to cancel -- the newer head supersedes them.
-#   * push:main runs are NOT. A cancelled run is not a failing run, so two quick
-#     merges under an unconditional `cancel-in-progress: true` would leave an
-#     already-merged commit with no completed gate verdict, and nothing reports
-#     the absence. That is strictly worse than having no concurrency group at
-#     all, and it would have been introduced BY a hardening.
+#   * Superseded PR runs are safe to cancel -- the newer head supersedes them,
+#     so `cancel-in-progress` is true for pull_request runs and they share one
+#     group per ref.
+#   * push:main runs are NOT safe to supersede. A cancelled run is not a failing
+#     run, so an already-merged commit would be left with no verdict and nothing
+#     reports the absence -- strictly worse than no concurrency group at all,
+#     and introduced BY a hardening.
 #
-# github.event_name is in the group key for the same reason: it stops a PR run
-# and a push run for the same ref from cancelling each other.
+# `cancel-in-progress: false` alone does NOT deliver that (finding S2, ALI-128
+# security pass). It stops in-progress cancellation, but eviction of a PENDING
+# run is unconditional in GitHub Actions and independent of that setting: a run
+# entering a group that already has one in progress goes pending, and any
+# previously pending run in the same group is cancelled. With every push to main
+# sharing one group, three merges inside one run's duration would evict the
+# second commit's queued run before it ever started -- the exact failure mode
+# described above, reached by the other door. Two rapid pushes look fine; it
+# takes three to see it.
+#
+# So push events key on github.sha: every commit to main gets a group of its
+# own, where it can neither cancel another run nor be evicted by one. PR runs
+# keep the ref-based key and their cancellation behaviour exactly as designed.
+# github.event_name stays in the key so a PR run and the push run for its own
+# merge cannot collide (they key on refs/pull/N/merge and refs/heads/main
+# respectively, but the split makes that independent of ref naming).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
