@@ -60,14 +60,37 @@ jobs:
 
       # The dispatcher landed in ALI-102/ALI-103, so package.json and the
       # vitest suite (src/dispatcher/__tests__/) now exist: this step runs
-      # `npm ci && npm test` and is a real gate, not a no-op success. The
-      # guard stays because this seed is templated into product clones
-      # (§14) that may have no dispatcher yet -- there it must succeed,
-      # not skip, so the job stays green.
+      # `npm ci --ignore-scripts && npm test` and is a real gate, not a
+      # no-op success. The guard stays because this seed is templated into
+      # product clones (§14) that may have no dispatcher yet -- there it
+      # must succeed, not skip, so the job stays green.
+      #
+      # SECURITY -- security-pass finding F2, closed in part by ALI-137.
+      # This job executes code authored by the pull request under review,
+      # fork PRs included: `npm test` runs the suite of the very change
+      # being reviewed. That is by design -- a gate that does not run the
+      # proposed code is not a gate.
+      #
+      # `--ignore-scripts` is therefore a SUPPLY-CHAIN control, not an
+      # anti-fork-attacker control. It blocks preinstall/install/postinstall
+      # hooks in dependencies -- a compromised transitive package firing
+      # before any human reads the diff (cf. tj-actions/changed-files, 2025).
+      # It does NOT stop `npm test` from running PR-authored code, and on
+      # `pull_request` the workflow that runs is the copy in the PR head, so
+      # a deliberate fork attacker can simply delete this flag from their
+      # own copy. Both residuals stay open by design; do not read this flag
+      # as closing them.
+      #
+      # What actually bounds an attacker here is that this job is SECRETLESS
+      # and read-only: no `secrets.*` reference, no credential-bearing `env:`,
+      # workflow-level `permissions: contents: read`, and the trigger stays
+      # `pull_request` -- never `pull_request_target`. Adding a secret to
+      # this job, or widening those permissions, requires revisiting fork-PR
+      # policy first (ALI-127: require approval for fork-PR workflow runs).
       - name: Run dispatcher tests if present
         run: |
           if [ -f package.json ]; then
-            npm ci
+            npm ci --ignore-scripts
             npm test
           else
             echo "no package.json — dispatcher not yet landed"
