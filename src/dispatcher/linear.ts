@@ -25,6 +25,15 @@ export interface CycleRef {
 /** A candidate as fetched from Linear: the core `Issue` shape, with its workflow state always present. */
 export interface LinearIssue extends Issue {
   state: IssueState;
+  /**
+   * The issue's raw Linear description, verbatim markdown -- the ONLY
+   * source `blindqa.ts`'s `extractBlindView()` reads from (ALI-105). Never
+   * consumed directly by `plan.ts`'s pure core (it stays plain `Issue`
+   * there); carried here so the runtime can extract the blind test-author's
+   * view (`## Acceptance criteria` / `## Invariant` / `## Definition of
+   * done`) without threading a second fetch or a new port method.
+   */
+  body: string;
 }
 
 export interface LinearPort {

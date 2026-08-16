@@ -38,12 +38,14 @@
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { extractBlindView, type BlindDispatchContext } from "./blindqa.js";
 import { hasDangerLabel, plan, weightedCost } from "./plan.js";
 import type { DispatcherConfig, Issue, RunPlan } from "./types.js";
 import {
   checkStatusDrift,
   statusDriftMessage,
   type CycleRef,
+  type LinearIssue,
   type LinearPort,
 } from "./linear.js";
 import type { DraftPrResult, EnginePinPort, GitHubPort, WorktreeHandle, WorktreePort } from "./worktree.js";
@@ -69,6 +71,9 @@ import {
 
 export type Seat = "builder" | "reviewer" | "security";
 
+/** Re-exported for callers (tests included) that want the blind seat's context type without a second import. */
+export type { BlindDispatchContext } from "./blindqa.js";
+
 export interface DispatchContext {
   issue: Issue;
   worktreePath: string;
@@ -92,6 +97,22 @@ export interface AgentDispatchResult {
 }
 
 /**
+ * What the blind test-author's dispatch returns (ALI-105). Deliberately not
+ * `AgentDispatchResult`: the blind seat never produces a free-text
+ * `summary`, and its `ambiguous`-shaped signal (an untestable criterion)
+ * must never route through `finalizeNeedsPedro()` the way the builder's
+ * does (AC8) — giving it its own result type makes that impossible to wire
+ * up by accident, rather than merely undocumented.
+ */
+export interface BlindQaDispatchResult {
+  /** Paths the seat wrote under `.engine/blind-tests/<ISSUE-ID>/` — test files plus `manifest.json`. */
+  testFilesWritten: string[];
+  /** Acceptance-criterion numbers the seat could not write a test for (AC3, AC8) — never guessed, always named. */
+  untestableCriteria: number[];
+  tokensUsed?: number;
+}
+
+/**
  * Dispatches one seat (builder/reviewer/security). The real adapter shells
  * out to the `claude` CLI; for this PR it is a thin stub clearly marked as
  * wired in a follow-up issue (matching this port's treatment in the spec) —
@@ -100,6 +121,16 @@ export interface AgentDispatchResult {
  */
 export interface AgentPort {
   dispatch(seat: Seat, ctx: DispatchContext): Promise<AgentDispatchResult>;
+  /**
+   * The blind test-author's entry point (ALI-105) — deliberately a
+   * *different method*, taking a *different context type*, from `dispatch`
+   * above. `BlindDispatchContext` carries none of `DispatchContext`'s
+   * fields (`worktreePath`, `branch`, `enginePath`, the full `issue`) — see
+   * `blindqa.ts`. That asymmetry is what makes "nothing describing the
+   * implementation can reach this seat" a property the compiler enforces
+   * rather than a convention `dispatch()` callers are trusted to honor.
+   */
+  dispatchBlindQa(ctx: BlindDispatchContext): Promise<BlindQaDispatchResult>;
 }
 
 export interface Clock {
@@ -114,6 +145,14 @@ export function createClaudeCliAgentPort(): AgentPort {
       throw new Error(
         "AgentPort real adapter not wired in this PR (shells out to the claude CLI) — " +
           'see the ALI-103 PR\'s "Decisions the spec left open" section.',
+      );
+    },
+    dispatchBlindQa(): Promise<BlindQaDispatchResult> {
+      throw new Error(
+        "AgentPort real adapter not wired in this PR (dispatchBlindQa, shells out to the claude CLI) — " +
+          'see the ALI-103 PR\'s "Decisions the spec left open" section. ALI-105 wires the runtime dispatch ' +
+          "call itself (proven against fakes); the real claude-CLI adapter for it stays a stub, same as " +
+          "builder/reviewer/security.",
       );
     },
   };
@@ -251,6 +290,20 @@ function evaluateSoftBackstop(
 // The candidate ledger — one entry per Ready issue in the cycle (AC2)
 // ---------------------------------------------------------------------------
 
+/**
+ * `Issue` (the type every dispatch-pipeline function is declared against)
+ * carries no `body` — only `LinearIssue` does (`linear.ts`). At runtime the
+ * object flowing through this pipeline always originated from
+ * `LinearPort.getReadyIssuesInCycle()`, so it always carries one; this is
+ * the single, explicit place that reaches for it, rather than widening
+ * `Issue` itself and letting `body` leak into every pure function that
+ * takes one (`plan.ts`'s core included).
+ */
+function issueBody(issue: Issue): string {
+  const body = (issue as LinearIssue).body;
+  return typeof body === "string" ? body : "";
+}
+
 function mustGetLedger(ledger: Map<string, CandidateLogEntry>, id: string): CandidateLogEntry {
   const entry = ledger.get(id);
   if (!entry) throw new Error(`internal error: no ledger entry for issue ${id}`);
@@ -285,7 +338,7 @@ function buildCandidateLedger(runPlan: RunPlan): Map<string, CandidateLogEntry> 
 }
 
 // ---------------------------------------------------------------------------
-// Per-issue dispatch pipeline: builder -> blind QA (skipped) -> reviewer -> security?
+// Per-issue dispatch pipeline: builder -> blind QA (ALI-105) -> reviewer -> security?
 // ---------------------------------------------------------------------------
 
 interface IssueDispatchResult {
@@ -429,9 +482,37 @@ async function dispatchOneIssue(
     return { hardKilled: true, outcome: "parked", seats, bounces, tokensUsed };
   }
 
-  // Stage 2: blind QA -- ALI-105's seat does not exist yet. An explicit,
-  // loud skip -- never a silent pass.
-  seats.push({ seat: "blindQa", status: "skipped (seat not built)" });
+  // Stage 2: blind QA (ALI-105) -- a real dispatch, through an entry point
+  // that takes a *different* context type than every other seat's. The
+  // extraction below reads only the issue's own id/title/body; it never
+  // sees `ctx` (worktreePath/branch/enginePath), so there is no path by
+  // which this stage could hand the seat anything describing the
+  // implementation, even if a future edit tried to.
+  const blindView = extractBlindView({ id: issue.id, title: issue.title, body: issueBody(issue) });
+  if (!blindView.ok) {
+    // AC7: loud skip, never a silent "ran" with nothing produced. Routing
+    // is unchanged -- this never reroutes to Needs Pedro or Parked; the run
+    // continues straight to the reviewer, same as every other blindQa exit.
+    seats.push({ seat: "blindQa", status: "skipped (unparseable criteria)", detail: blindView.reason });
+    await deps.linear.addComment(
+      issue.id,
+      `Blind QA skipped for ${issue.id}: ${blindView.reason}. This is a spec escape (the issue's ` +
+        "acceptance criteria are unparseable), not an ambiguity -- routing is unchanged, and the run " +
+        "continues to the reviewer.",
+    );
+  } else {
+    const blindResult = await deps.agent.dispatchBlindQa(blindView.context);
+    tokensUsed += blindResult.tokensUsed ?? 0;
+    const detailParts = [`${blindResult.testFilesWritten.length} test file(s) written`];
+    if (blindResult.untestableCriteria.length > 0) {
+      // AC8: named by number, in the seat detail (and therefore in the
+      // seat-summary comment `finalizeOpenedPr` renders below) -- never
+      // silently dropped, and never routed through finalizeNeedsPedro
+      // (that branch only ever reads `builderResult.ambiguous`, above).
+      detailParts.push(`untestable criteria: ${blindResult.untestableCriteria.join(", ")}`);
+    }
+    seats.push({ seat: "blindQa", status: "ran", detail: detailParts.join("; ") });
+  }
 
   // Stage 3: reviewer.
   const reviewerResult = await deps.agent.dispatch("reviewer", ctx);

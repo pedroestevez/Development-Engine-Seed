@@ -12,6 +12,8 @@ import {
   runLogPath,
   type AgentDispatchResult,
   type AgentPort,
+  type BlindDispatchContext,
+  type BlindQaDispatchResult,
   type Clock,
   type DispatchContext,
   type RunDeps,
@@ -46,7 +48,36 @@ const execFileAsync = promisify(execFile);
 // Shared fixtures and fakes
 // ---------------------------------------------------------------------------
 
-function makeIssue(id: string, points: number, extra: Partial<Issue> = {}): LinearIssue {
+// ALI-105: a full issue body -- all three sections the blind seat reads,
+// plus `## Why`/`## What` it must never see -- so this file's *existing*
+// fixtures (criteria 1-11, unrelated to blindQa) dispatch blindQa for real
+// by default instead of hitting the unparseable-criteria skip. Tests that
+// care about blindQa's own behavior override `body` explicitly.
+const FULL_BODY_FIXTURE = [
+  "## Why",
+  "",
+  "Fixture reasoning -- never handed to the blind seat.",
+  "",
+  "## What",
+  "",
+  "Fixture implementation sketch -- never handed to the blind seat.",
+  "",
+  "## Acceptance criteria",
+  "",
+  "1. It does the thing.",
+  "2. It never does the other thing.",
+  "",
+  "## Invariant",
+  "",
+  "The thing always holds.",
+  "",
+  "## Definition of done",
+  "",
+  "Tests green.",
+  "",
+].join("\n");
+
+function makeIssue(id: string, points: number, extra: Partial<Issue> & { body?: string } = {}): LinearIssue {
   return {
     id,
     title: extra.title ?? `Issue ${id}`,
@@ -56,6 +87,7 @@ function makeIssue(id: string, points: number, extra: Partial<Issue> = {}): Line
     blockedBy: extra.blockedBy ?? [],
     predictedFiles: extra.predictedFiles ?? [],
     state: "Ready",
+    body: extra.body ?? FULL_BODY_FIXTURE,
   };
 }
 
@@ -254,9 +286,20 @@ type AgentScript = (
   callIndex: number,
 ) => AgentDispatchResult | Promise<AgentDispatchResult>;
 
-function createFakeAgent(script?: AgentScript): { port: AgentPort; calls: AgentCall[] } {
+/** ALI-105: the blind seat's own dispatch script -- takes only `BlindDispatchContext`, never `DispatchContext`. */
+type BlindAgentScript = (
+  ctx: BlindDispatchContext,
+  callIndex: number,
+) => BlindQaDispatchResult | Promise<BlindQaDispatchResult>;
+
+function createFakeAgent(
+  script?: AgentScript,
+  blindScript?: BlindAgentScript,
+): { port: AgentPort; calls: AgentCall[]; blindCalls: BlindDispatchContext[] } {
   const calls: AgentCall[] = [];
+  const blindCalls: BlindDispatchContext[] = [];
   let callIndex = 0;
+  let blindCallIndex = 0;
   const port: AgentPort = {
     async dispatch(seat, ctx) {
       calls.push({ seat, issueId: ctx.issue.id, worktreePath: ctx.worktreePath });
@@ -264,8 +307,14 @@ function createFakeAgent(script?: AgentScript): { port: AgentPort; calls: AgentC
       if (script) return script(seat, ctx, idx);
       return { summary: `${seat} ok` };
     },
+    async dispatchBlindQa(ctx) {
+      blindCalls.push(ctx);
+      const idx = blindCallIndex++;
+      if (blindScript) return blindScript(ctx, idx);
+      return { testFilesWritten: [`${ctx.issueId}.blind.test.ts`], untestableCriteria: [] };
+    },
   };
-  return { port, calls };
+  return { port, calls, blindCalls };
 }
 
 const BASE_DISPATCHER_CONFIG: DispatcherConfig = { budget: 5, riskWeight: 2.0, maxConcurrency: 4 };
@@ -1116,17 +1165,218 @@ describe("supplementary: an ambiguous issue goes to Needs Pedro (cycle cleared) 
 });
 
 // ---------------------------------------------------------------------------
-// supplementary: blind QA seat is always an explicit, loud skip
+// ALI-105: the blind test-author seat -- criteria 5-9
 // ---------------------------------------------------------------------------
 
-describe("supplementary: blind QA (ALI-105) is never a silent pass", () => {
-  it("every dispatched issue records blindQa as 'skipped (seat not built)'", async () => {
+// A body deliberately missing the "## Acceptance criteria" heading entirely.
+const NO_AC_HEADING_BODY = ["## Why", "", "stuff", "", "## What", "", "more stuff", ""].join("\n");
+
+// A body with the heading present but nothing under it before the next section.
+const EMPTY_AC_SECTION_BODY = ["## Acceptance criteria", "", "## Invariant", "", "holds", ""].join("\n");
+
+describe("ALI-105 criterion 5: blind QA dispatches for real -- no more hardcoded skip", () => {
+  it("every dispatched issue's blindQa seat is a real dispatch call, through dispatchBlindQa (never dispatch)", async () => {
     const issue = makeIssue("qa-check", 1);
     const { port: linear } = createFakeLinear({ readyIssues: [issue] });
-    const result = await runDispatcher(makeConfig(), makeDeps({ linear }));
+    const { port: agent, calls, blindCalls } = createFakeAgent();
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+
+    expect(blindCalls).toHaveLength(1);
+    expect(blindCalls[0]?.issueId).toBe("qa-check");
+    // Went through dispatchBlindQa, not dispatch() -- `calls` (dispatch()'s
+    // own call log) has no blindQa entry to find at all, by construction:
+    // `Seat` doesn't even include "blindQa" as a value.
+    expect(calls.filter((c) => c.issueId === "qa-check")).toHaveLength(2); // builder + reviewer only
+
     const entry = result.runLog.candidates.find((c) => c.issueId === "qa-check");
     const qaSeat = entry?.seats.find((s) => s.seat === "blindQa");
-    expect(qaSeat?.status).toBe("skipped (seat not built)");
+    expect(qaSeat?.status).toBe("ran");
+    // AC5's other half -- the retired status string no longer appearing
+    // anywhere in src/** (a repo grep returns no hits) -- is deliberately
+    // NOT re-typed here as a string literal: doing so would put a hit back
+    // into src/** and defeat the grep this test's own docstring relies on.
+    // Verified instead by `SeatOutcome["status"]`'s union (this file
+    // wouldn't typecheck if "ran" weren't a legal value) and recorded as a
+    // literal grep in the PR body.
+  });
+});
+
+describe("ALI-105 criterion 6: structural blindness -- the runtime half", () => {
+  it("the captured blind context's own keys are exactly the five allowed fields, all non-empty, and none of DispatchContext's fields", async () => {
+    const issue = makeIssue("blind-shape", 1, { predictedFiles: ["src/shape.ts"] });
+    const { port: linear } = createFakeLinear({ readyIssues: [issue] });
+    let captured: BlindDispatchContext | undefined;
+    const { port: agent } = createFakeAgent(undefined, async (ctx) => {
+      captured = ctx;
+      return { testFilesWritten: [], untestableCriteria: [] };
+    });
+
+    await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+
+    expect(captured).toBeDefined();
+
+    // (a) present and non-empty.
+    const ALLOWED_KEYS = ["issueId", "title", "acceptanceCriteria", "invariant", "definitionOfDone"] as const;
+    const actualKeys = Object.keys(captured as object).sort();
+    expect(actualKeys).toEqual([...ALLOWED_KEYS].sort());
+    for (const key of ALLOWED_KEYS) {
+      expect((captured as unknown as Record<string, unknown>)[key]).toBeTruthy();
+    }
+
+    // (b) absent -- asserted against the captured object's OWN keys, so a
+    // later field added to BlindDispatchContext by mistake fails this test
+    // rather than silently passing.
+    const FORBIDDEN_KEYS = ["worktreePath", "branch", "predictedFiles", "diff", "labels", "body"];
+    for (const key of FORBIDDEN_KEYS) {
+      expect(Object.prototype.hasOwnProperty.call(captured as object, key)).toBe(false);
+    }
+  });
+
+  it("DispatchContext is not assignable to BlindDispatchContext -- compile-time proof, enforced by npm run typecheck", () => {
+    // This function is declared, never called: the value under test is
+    // whether the line below type-checks, not any runtime behavior. If a
+    // future edit widens BlindDispatchContext (e.g. makes a field optional,
+    // or adds `worktreePath?`) such that the assignment below stops being
+    // an error, `@ts-expect-error` itself becomes an error ("unused
+    // ts-expect-error directive") and `npm run typecheck` goes red -- the
+    // proof is the compiler run, not this test's runtime assertion.
+    function neverCalled(ctx: DispatchContext): void {
+      // @ts-expect-error -- DispatchContext carries worktreePath/branch/enginePath/issue;
+      // BlindDispatchContext requires issueId/title/acceptanceCriteria/invariant/definitionOfDone,
+      // none of which DispatchContext has. Structural assignability must fail here.
+      const blind: BlindDispatchContext = ctx;
+      void blind;
+    }
+    expect(typeof neverCalled).toBe("function");
+  });
+});
+
+describe("ALI-105 criterion 7: unparseable criteria -- loud skip, never dispatched, run continues", () => {
+  it("no '## Acceptance criteria' heading at all: skipped (unparseable criteria), Linear comment posted, reviewer still runs", async () => {
+    const issue = makeIssue("no-ac-heading", 1, { body: NO_AC_HEADING_BODY });
+    const { port: linear, state: linearState } = createFakeLinear({ readyIssues: [issue] });
+    const { port: agent, calls, blindCalls } = createFakeAgent();
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+
+    const entry = result.runLog.candidates.find((c) => c.issueId === "no-ac-heading");
+    const qaSeat = entry?.seats.find((s) => s.seat === "blindQa");
+    expect(qaSeat?.status).toBe("skipped (unparseable criteria)");
+    expect(blindCalls).toEqual([]); // never dispatched -- not even attempted
+
+    const skipComment = linearState.comments.find(
+      (c) => c.issueId === "no-ac-heading" && /acceptance criteria/i.test(c.body),
+    );
+    expect(skipComment).toBeDefined();
+    expect(skipComment?.body).toContain("no-ac-heading");
+    expect(skipComment?.body).toMatch(/heading/i);
+
+    // Routing unchanged: continues straight to the reviewer, ends opened-pr.
+    expect(calls.some((c) => c.issueId === "no-ac-heading" && c.seat === "reviewer")).toBe(true);
+    expect(entry?.outcome).toBe("opened-pr");
+    const lastStatus = linearState.statusChanges.filter((c) => c.issueId === "no-ac-heading").at(-1);
+    expect(lastStatus?.status).toBe("In Review");
+  });
+
+  it("'## Acceptance criteria' heading present but empty: same loud skip, distinct reason text", async () => {
+    const issue = makeIssue("empty-ac", 1, { body: EMPTY_AC_SECTION_BODY });
+    const { port: linear, state: linearState } = createFakeLinear({ readyIssues: [issue] });
+    const { port: agent, blindCalls } = createFakeAgent();
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+
+    const entry = result.runLog.candidates.find((c) => c.issueId === "empty-ac");
+    const qaSeat = entry?.seats.find((s) => s.seat === "blindQa");
+    expect(qaSeat?.status).toBe("skipped (unparseable criteria)");
+    expect(blindCalls).toEqual([]);
+
+    const skipComment = linearState.comments.find(
+      (c) => c.issueId === "empty-ac" && /acceptance criteria/i.test(c.body),
+    );
+    expect(skipComment?.body).toMatch(/empty/i);
+    expect(entry?.outcome).toBe("opened-pr"); // never Needs Pedro, never Parked
+  });
+});
+
+describe("ALI-105 criterion 8: an untestable criterion is recorded and commented, routing unchanged", () => {
+  it("named by number in the seat detail and the seat-summary comment; never reroutes to Needs Pedro", async () => {
+    const issue = makeIssue("untestable-crit", 1);
+    const { port: linear, state: linearState } = createFakeLinear({ readyIssues: [issue] });
+    const { port: agent } = createFakeAgent(undefined, async () => ({
+      testFilesWritten: ["t1.blind.test.ts"],
+      untestableCriteria: [3],
+    }));
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+
+    const entry = result.runLog.candidates.find((c) => c.issueId === "untestable-crit");
+    const qaSeat = entry?.seats.find((s) => s.seat === "blindQa");
+    expect(qaSeat?.status).toBe("ran"); // recorded on a "ran" seat -- not a distinct status
+    expect(qaSeat?.detail).toContain("3");
+
+    // Routing unchanged: opened-pr, "In Review" -- never Needs Pedro (that
+    // path only ever reads the BUILDER's `ambiguous` field, never blindQa's).
+    expect(entry?.outcome).toBe("opened-pr");
+    const lastStatus = linearState.statusChanges.filter((c) => c.issueId === "untestable-crit").at(-1);
+    expect(lastStatus?.status).toBe("In Review");
+    expect(lastStatus?.status).not.toBe("Needs Pedro");
+
+    // Named by number in the seat-summary comment `finalizeOpenedPr` posts.
+    const openComment = linearState.comments.find(
+      (c) => c.issueId === "untestable-crit" && /blindQa/.test(c.body),
+    );
+    expect(openComment?.body).toContain("3");
+  });
+
+  it("multiple untestable criteria are all named, none dropped", async () => {
+    const issue = makeIssue("multi-untestable", 1);
+    const { port: linear } = createFakeLinear({ readyIssues: [issue] });
+    const { port: agent } = createFakeAgent(undefined, async () => ({
+      testFilesWritten: [],
+      untestableCriteria: [2, 5, 7],
+    }));
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+
+    const entry = result.runLog.candidates.find((c) => c.issueId === "multi-untestable");
+    const qaSeat = entry?.seats.find((s) => s.seat === "blindQa");
+    for (const n of [2, 5, 7]) expect(qaSeat?.detail).toContain(String(n));
+    expect(entry?.outcome).toBe("opened-pr");
+  });
+});
+
+describe("ALI-105 criterion 9: exactly one blindQa seat entry, enumerated status, for every completed issue", () => {
+  it("walks every candidate with outcome 'opened-pr' in a multi-issue run", async () => {
+    const clean = makeIssue("multi-clean", 1, { priority: 1, predictedFiles: ["a.ts"] });
+    const unparseable = makeIssue("multi-unparseable", 1, {
+      priority: 2,
+      predictedFiles: ["b.ts"],
+      body: NO_AC_HEADING_BODY,
+    });
+    const withDangerLabel = makeIssue("multi-danger", 1, {
+      priority: 3,
+      predictedFiles: ["c.ts"],
+      labels: ["payments"],
+    });
+    const { port: linear } = createFakeLinear({ readyIssues: [clean, unparseable, withDangerLabel] });
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear }));
+
+    const ENUMERATED_BLIND_QA_STATUSES = ["ran", "skipped (unparseable criteria)"];
+    const openedPrCandidates = result.runLog.candidates.filter((c) => c.outcome === "opened-pr");
+    expect(openedPrCandidates.length).toBeGreaterThan(0); // sanity: this run actually completed some
+
+    for (const candidate of openedPrCandidates) {
+      const qaSeats = candidate.seats.filter((s) => s.seat === "blindQa");
+      expect(qaSeats).toHaveLength(1);
+      expect(ENUMERATED_BLIND_QA_STATUSES).toContain(qaSeats[0]?.status);
+    }
+    // All three fixtures here fit the default 5-point budget individually
+    // and share no files/blockers -- every one should reach opened-pr.
+    expect(openedPrCandidates.map((c) => c.issueId).sort()).toEqual(
+      ["multi-clean", "multi-danger", "multi-unparseable"].sort(),
+    );
   });
 });
 

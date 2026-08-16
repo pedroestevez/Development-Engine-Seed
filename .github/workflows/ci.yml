@@ -48,6 +48,23 @@ jobs:
       - name: Check roster matches docs/ENGINE.md §14
         run: node scripts/check-roster-consistency.js
 
+  blind-qa-tools-allowlist:
+    name: Blind QA tools allowlist (ALI-105 AC2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # The structural half of the blind test-author's blindness:
+      # .claude/agents/qa.md's `tools:` frontmatter must be exactly `Write`
+      # -- no Read/Edit/Grep/Glob/Bash/etc., no mcp__* tool. Fails loud if
+      # the key is missing or names any forbidden tool.
+      - name: Check qa.md's tools allowlist is exactly Write
+        run: node scripts/check-qa-tools-allowlist.js
+
   dispatcher-tests:
     name: Dispatcher unit tests (placeholder)
     runs-on: ubuntu-latest
