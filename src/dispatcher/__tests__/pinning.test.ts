@@ -17,7 +17,16 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { runDispatcher, type AgentDispatchResult, type Clock, type DispatchContext, type RunDeps, type RuntimeConfig } from "../run.js";
+import {
+  runDispatcher,
+  type AgentDispatchResult,
+  type BlindDispatchContext,
+  type BlindQaDispatchResult,
+  type Clock,
+  type DispatchContext,
+  type RunDeps,
+  type RuntimeConfig,
+} from "../run.js";
 import {
   createGitEnginePinPort,
   type DraftPrParams,
@@ -38,7 +47,34 @@ const execFileAsync = promisify(execFile);
 // per-file fixture convention).
 // ---------------------------------------------------------------------------
 
-function makeIssue(id: string, points: number, extra: Partial<Issue> = {}): LinearIssue {
+// ALI-105: a body carrying all three sections the blind seat reads, so this
+// file's fixtures dispatch blindQa for real by default rather than hitting
+// the unparseable-criteria skip -- this file's own tests are about the
+// engine pin, not blindQa, so its default behavior should stay out of the way.
+const FULL_BODY_FIXTURE = [
+  "## Why",
+  "",
+  "Fixture reasoning -- never handed to the blind seat.",
+  "",
+  "## What",
+  "",
+  "Fixture implementation sketch -- never handed to the blind seat.",
+  "",
+  "## Acceptance criteria",
+  "",
+  "1. It does the thing.",
+  "",
+  "## Invariant",
+  "",
+  "The thing always holds.",
+  "",
+  "## Definition of done",
+  "",
+  "Tests green.",
+  "",
+].join("\n");
+
+function makeIssue(id: string, points: number, extra: Partial<Issue> & { body?: string } = {}): LinearIssue {
   return {
     id,
     title: extra.title ?? `Issue ${id}`,
@@ -48,6 +84,7 @@ function makeIssue(id: string, points: number, extra: Partial<Issue> = {}): Line
     blockedBy: extra.blockedBy ?? [],
     predictedFiles: extra.predictedFiles ?? [],
     state: "Ready",
+    body: extra.body ?? FULL_BODY_FIXTURE,
   };
 }
 
@@ -124,6 +161,11 @@ function createFakeWorktree(): {
       createdBaseRefs.push(baseRef);
       return { path: `/fake/worktrees/${branch}`, branch };
     },
+    // ALI-133: not this file's concern (no test here asserts on fork calls)
+    // -- present only so the fake satisfies `WorktreePort`.
+    async forkBranch(handle, branch) {
+      return { path: handle.path, branch };
+    },
     async preserve(handle) {
       preserved.push(handle);
     },
@@ -154,13 +196,22 @@ type AgentScript = (seat: "builder" | "reviewer" | "security", ctx: DispatchCont
 
 function createFakeAgent(script?: AgentScript) {
   const calls: { seat: string; ctx: DispatchContext }[] = [];
+  const blindCalls: BlindDispatchContext[] = [];
   return {
     calls,
+    blindCalls,
     port: {
       async dispatch(seat: "builder" | "reviewer" | "security", ctx: DispatchContext) {
         calls.push({ seat, ctx });
         if (script) return script(seat, ctx);
         return { summary: `${seat} ok` };
+      },
+      // ALI-105: not under test in this file -- a no-op default is enough
+      // to satisfy `AgentPort` and let blindQa dispatch for real (see
+      // `FULL_BODY_FIXTURE` above) without any pinning test needing to care.
+      async dispatchBlindQa(ctx: BlindDispatchContext): Promise<BlindQaDispatchResult> {
+        blindCalls.push(ctx);
+        return { testFilesWritten: [], untestableCriteria: [] };
       },
     },
   };
@@ -187,6 +238,8 @@ function makeConfig(overrides: Partial<RuntimeConfig> = {}): RuntimeConfig {
     dispatcher: overrides.dispatcher ?? BASE_DISPATCHER_CONFIG,
     backstop: overrides.backstop ?? { wallClockSoftMs: 1_000_000, wallClockHardMs: 2_000_000 },
     baseRef: overrides.baseRef ?? "origin/main",
+    // ALI-133: distinct from `baseRef` -- see that file's fixture for why.
+    basePrBranch: overrides.basePrBranch ?? "main",
     requiredPin: overrides.requiredPin,
   };
 }
@@ -314,26 +367,37 @@ describe("AC2 (unit): every DispatchContext carries the pinned tree's path; crea
 // AC3: work worktrees branch from the pin; PRs still target baseRef.
 // ---------------------------------------------------------------------------
 
-describe("AC3: work worktrees branch from the resolved pin; openDraftPr still targets config.baseRef", () => {
-  it("createWorktree's baseRef equals runLog.engineSha, and openDraftPr's base equals config.baseRef -- never collapsed", async () => {
+describe("AC3: work worktrees branch from the resolved pin; openDraftPr's base is basePrBranch, never baseRef", () => {
+  it("createWorktree's baseRef equals runLog.engineSha, and openDraftPr's base equals config.basePrBranch -- never config.baseRef", async () => {
+    // ALI-133 AC4 corrects this criterion's own PR-base assertion: the
+    // pre-ALI-133 version of this test asserted `prs[0]?.base === config.baseRef`
+    // ("origin/main") -- exactly the latent bug ALI-133 found (a remote-tracking
+    // git ref real GitHub rejects as a PR base with a 422). `config.basePrBranch`
+    // is the corrected field for that purpose; `config.baseRef` stays reserved
+    // for what it always was -- the ref a worktree/branch can fork from.
     const issue = makeIssue("wk-1", 1);
     const { port: linear } = createFakeLinear([issue]);
     const { port: enginePin } = createFakeEnginePin("feedface000000000000000000000000000000");
     const { port: worktree, createdBaseRefs } = createFakeWorktree();
     const { port: github, prs } = createFakeGitHub();
 
-    const config = makeConfig({ baseRef: "origin/main" });
+    const config = makeConfig({ baseRef: "origin/main", basePrBranch: "main" });
     const result = await runDispatcher(config, makeDeps({ linear, enginePin, worktree, github }));
 
+    // The scaffold worktree still stands up from the resolved pin (ALI-104
+    // AC3, unchanged by ALI-133) -- this is the argument `createWorktree`
+    // itself received, before any per-issue fork happens.
     expect(createdBaseRefs).toEqual(["feedface000000000000000000000000000000"]);
     expect(createdBaseRefs[0]).toBe(result.runLog.engineSha);
 
     expect(prs).toHaveLength(1);
-    expect(prs[0]?.base).toBe("origin/main");
-    expect(prs[0]?.base).toBe(config.baseRef);
+    expect(prs[0]?.base).toBe("main");
+    expect(prs[0]?.base).toBe(config.basePrBranch);
 
-    // A PR opened against the pinned SHA would target a commit, not a
-    // branch, and could never be merged -- the two must never collapse.
+    // A PR base is a GitHub branch name -- never the remote-tracking ref a
+    // worktree/branch forks from, and never the pinned SHA either. All
+    // three must stay distinct even though they can name "the same place".
+    expect(prs[0]?.base).not.toBe(config.baseRef);
     expect(createdBaseRefs[0]).not.toBe(prs[0]?.base);
   });
 });

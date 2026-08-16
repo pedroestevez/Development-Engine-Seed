@@ -156,8 +156,14 @@ export type SeatName = "builder" | "blindQa" | "reviewer" | "security";
 
 export interface SeatOutcome {
   seat: SeatName;
-  /** "skipped (seat not built)" is reserved for blindQa until ALI-105 lands — never a silent pass. */
-  status: "ran" | "skipped (seat not built)" | "skipped (not applicable)";
+  /**
+   * `"skipped (unparseable criteria)"` is blindQa-specific (ALI-105 AC7):
+   * the issue body had no `## Acceptance criteria` heading, or that section
+   * was empty — the seat is never dispatched, and this is the loud,
+   * enumerated status recorded instead of a silent pass.
+   * `"skipped (not applicable)"` stays security-specific (no danger label).
+   */
+  status: "ran" | "skipped (unparseable criteria)" | "skipped (not applicable)";
   detail?: string;
 }
 

@@ -12,6 +12,8 @@ import {
   runLogPath,
   type AgentDispatchResult,
   type AgentPort,
+  type BlindDispatchContext,
+  type BlindQaDispatchResult,
   type Clock,
   type DispatchContext,
   type RunDeps,
@@ -46,7 +48,36 @@ const execFileAsync = promisify(execFile);
 // Shared fixtures and fakes
 // ---------------------------------------------------------------------------
 
-function makeIssue(id: string, points: number, extra: Partial<Issue> = {}): LinearIssue {
+// ALI-105: a full issue body -- all three sections the blind seat reads,
+// plus `## Why`/`## What` it must never see -- so this file's *existing*
+// fixtures (criteria 1-11, unrelated to blindQa) dispatch blindQa for real
+// by default instead of hitting the unparseable-criteria skip. Tests that
+// care about blindQa's own behavior override `body` explicitly.
+const FULL_BODY_FIXTURE = [
+  "## Why",
+  "",
+  "Fixture reasoning -- never handed to the blind seat.",
+  "",
+  "## What",
+  "",
+  "Fixture implementation sketch -- never handed to the blind seat.",
+  "",
+  "## Acceptance criteria",
+  "",
+  "1. It does the thing.",
+  "2. It never does the other thing.",
+  "",
+  "## Invariant",
+  "",
+  "The thing always holds.",
+  "",
+  "## Definition of done",
+  "",
+  "Tests green.",
+  "",
+].join("\n");
+
+function makeIssue(id: string, points: number, extra: Partial<Issue> & { body?: string } = {}): LinearIssue {
   return {
     id,
     title: extra.title ?? `Issue ${id}`,
@@ -56,6 +87,7 @@ function makeIssue(id: string, points: number, extra: Partial<Issue> = {}): Line
     blockedBy: extra.blockedBy ?? [],
     predictedFiles: extra.predictedFiles ?? [],
     state: "Ready",
+    body: extra.body ?? FULL_BODY_FIXTURE,
   };
 }
 
@@ -108,19 +140,32 @@ function createFakeLinear(overrides: Partial<FakeLinearState> = {}): { port: Lin
   return { port, state };
 }
 
+interface FakeForkCall {
+  path: string;
+  branch: string;
+  baseRef: string;
+}
+
 interface FakeWorktreeState {
   created: WorktreeHandle[];
+  /** ALI-133: every `forkBranch` call, in order -- the per-issue branch operation. */
+  forked: FakeForkCall[];
   preserved: WorktreeHandle[];
   removed: WorktreeHandle[];
 }
 
 function createFakeWorktree(): { port: WorktreePort; state: FakeWorktreeState } {
-  const state: FakeWorktreeState = { created: [], preserved: [], removed: [] };
+  const state: FakeWorktreeState = { created: [], forked: [], preserved: [], removed: [] };
   const port: WorktreePort = {
     async createWorktree(branch) {
       const handle: WorktreeHandle = { path: `/fake/worktrees/${branch}`, branch };
       state.created.push(handle);
       return handle;
+    },
+    async forkBranch(handle, branch, baseRef) {
+      state.forked.push({ path: handle.path, branch, baseRef });
+      // Path never changes -- only the branch checked out into it (ALI-133 AC2).
+      return { path: handle.path, branch };
     },
     async preserve(handle) {
       state.preserved.push(handle);
@@ -159,16 +204,50 @@ function createFakeEnginePin(sha = "abc1234"): { port: EnginePinPort; state: Fak
 interface FakeGitHubState {
   pushed: { path: string; branch: string }[];
   prs: DraftPrParams[];
+  /** ALI-133 AC5(a): branches real GitHub would accept as a PR base -- seeded with the repo's base branch. */
+  branches: Set<string>;
 }
 
-function createFakeGitHub(): { port: GitHubPort; state: FakeGitHubState } {
-  const state: FakeGitHubState = { pushed: [], prs: [] };
+/**
+ * ALI-133 AC5 (retro-mandated): models the two real-GitHub constraints the
+ * pre-fix fake was laxer than reality about, which is exactly what let the
+ * head→base collision through undetected:
+ *
+ *   (a)/(b) a `branches` set, seeded with `baseBranch` (default `"main"`),
+ *       that `pushBranch` adds to -- `base` must name a branch that's
+ *       actually been pushed (or the seeded base branch itself).
+ *   (c) `openDraftPr` throws when `base` is not in `branches`, naming the
+ *       offending base.
+ *   (d) `openDraftPr` throws when an open PR already exists for the same
+ *       `(branch, base)` pair, mirroring GitHub's real 422 ("A pull request
+ *       already exists for ..."). PRs are never closed or merged within a
+ *       run (non-goal), so this holds for the run's whole duration.
+ *
+ * AC7 exercises both (c) and (d) directly against this function, independent
+ * of the run loop -- deleting either constraint here must fail those tests.
+ */
+function createFakeGitHub(options: { baseBranch?: string } = {}): { port: GitHubPort; state: FakeGitHubState } {
+  const baseBranch = options.baseBranch ?? "main";
+  const state: FakeGitHubState = { pushed: [], prs: [], branches: new Set([baseBranch]) };
   let counter = 0;
   const port: GitHubPort = {
     async pushBranch(path, branch) {
       state.pushed.push({ path, branch });
+      state.branches.add(branch);
     },
     async openDraftPr(params) {
+      if (!state.branches.has(params.base)) {
+        throw new Error(
+          `GitHub rejected PR ${params.branch} -> ${params.base}: base branch "${params.base}" ` +
+            "was never pushed and is not the repo's base branch.",
+        );
+      }
+      const duplicate = state.prs.some((pr) => pr.branch === params.branch && pr.base === params.base);
+      if (duplicate) {
+        throw new Error(
+          `A pull request already exists for ${params.branch} -> ${params.base}. (422-shaped, mirrors real GitHub.)`,
+        );
+      }
       counter++;
       state.prs.push(params);
       return { number: counter, url: `https://github.com/fake/fake/pull/${counter}` };
@@ -207,9 +286,20 @@ type AgentScript = (
   callIndex: number,
 ) => AgentDispatchResult | Promise<AgentDispatchResult>;
 
-function createFakeAgent(script?: AgentScript): { port: AgentPort; calls: AgentCall[] } {
+/** ALI-105: the blind seat's own dispatch script -- takes only `BlindDispatchContext`, never `DispatchContext`. */
+type BlindAgentScript = (
+  ctx: BlindDispatchContext,
+  callIndex: number,
+) => BlindQaDispatchResult | Promise<BlindQaDispatchResult>;
+
+function createFakeAgent(
+  script?: AgentScript,
+  blindScript?: BlindAgentScript,
+): { port: AgentPort; calls: AgentCall[]; blindCalls: BlindDispatchContext[] } {
   const calls: AgentCall[] = [];
+  const blindCalls: BlindDispatchContext[] = [];
   let callIndex = 0;
+  let blindCallIndex = 0;
   const port: AgentPort = {
     async dispatch(seat, ctx) {
       calls.push({ seat, issueId: ctx.issue.id, worktreePath: ctx.worktreePath });
@@ -217,8 +307,14 @@ function createFakeAgent(script?: AgentScript): { port: AgentPort; calls: AgentC
       if (script) return script(seat, ctx, idx);
       return { summary: `${seat} ok` };
     },
+    async dispatchBlindQa(ctx) {
+      blindCalls.push(ctx);
+      const idx = blindCallIndex++;
+      if (blindScript) return blindScript(ctx, idx);
+      return { testFilesWritten: [`${ctx.issueId}.blind.test.ts`], untestableCriteria: [] };
+    },
   };
-  return { port, calls };
+  return { port, calls, blindCalls };
 }
 
 const BASE_DISPATCHER_CONFIG: DispatcherConfig = { budget: 5, riskWeight: 2.0, maxConcurrency: 4 };
@@ -230,6 +326,11 @@ function makeConfig(overrides: Partial<RuntimeConfig> = {}): RuntimeConfig {
     // test deliberately advances the fake clock to trip it.
     backstop: overrides.backstop ?? { wallClockSoftMs: 1_000_000, wallClockHardMs: 2_000_000 },
     baseRef: overrides.baseRef ?? "origin/main",
+    // ALI-133: the fallback PR base for a cluster's first issue -- a real
+    // GitHub branch name, distinct from `baseRef`. Matches the default
+    // `createFakeGitHub()` seeds as its base branch, so existing fixtures
+    // that don't care about this distinction keep passing unmodified.
+    basePrBranch: overrides.basePrBranch ?? "main",
     // ALI-104: no `engineSha` field -- the run resolves its own pin via
     // `RunDeps.enginePin` (see `createFakeEnginePin` above), never a config
     // input. `requiredPin` (engine-drift) stays unset by default here.
@@ -492,6 +593,7 @@ describe("criterion 6: two clusters dispatch concurrently; same-file issues shar
 
     const { port: linear } = createFakeLinear({ readyIssues: [sameA, sameB, other] });
     const { port: worktree, state: worktreeState } = createFakeWorktree();
+    const { port: github, state: githubState } = createFakeGitHub();
 
     // Proves genuine concurrency: each cluster-starting builder call blocks
     // until BOTH cluster-starting builders have been invoked. If the run
@@ -513,7 +615,7 @@ describe("criterion 6: two clusters dispatch concurrently; same-file issues shar
     });
 
     const config = makeConfig({ dispatcher: { budget: 5, riskWeight: 2.0, maxConcurrency: 2 } });
-    const result = await runDispatcher(config, makeDeps({ linear, worktree, agent }));
+    const result = await runDispatcher(config, makeDeps({ linear, worktree, github, agent }));
 
     // Exactly two worktrees: one per cluster.
     expect(worktreeState.created).toHaveLength(2);
@@ -532,6 +634,123 @@ describe("criterion 6: two clusters dispatch concurrently; same-file issues shar
     expect(result.runLog.stopReason).toBe("cycle-empty");
     const outcomeById = Object.fromEntries(result.runLog.candidates.map((c) => [c.issueId, c.outcome]));
     expect(outcomeById).toEqual({ "same-a": "opened-pr", "same-b": "opened-pr", other: "opened-pr" });
+
+    // ALI-133: added, not weakened (AC11) -- one PR per issue, heads name
+    // exactly one issue id each, and same-b's PR stacks on same-a's branch
+    // (same cluster, chained) while other's PR (a different, independent
+    // cluster) targets basePrBranch directly, having no predecessor.
+    expect(githubState.prs).toHaveLength(3);
+    const prByBranch = Object.fromEntries(githubState.prs.map((pr) => [pr.branch, pr]));
+    expect(Object.keys(prByBranch).sort()).toEqual(["dispatcher/other", "dispatcher/same-a", "dispatcher/same-b"]);
+    expect(prByBranch["dispatcher/same-a"]?.base).toBe(config.basePrBranch);
+    expect(prByBranch["dispatcher/same-b"]?.base).toBe("dispatcher/same-a");
+    expect(prByBranch["dispatcher/other"]?.base).toBe(config.basePrBranch);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ALI-133 AC6: regression -- the exact scenario real GitHub 422s on today.
+// Run against the pre-fix `branchNameFor(cluster)` + `base: config.baseRef`,
+// this test throws (both issues would share one branch as PR head, and the
+// second `openDraftPr` call would collide on an identical (branch, base)
+// pair -- rejected by the AC5-hardened fake exactly as real GitHub would).
+// ---------------------------------------------------------------------------
+
+describe("ALI-133 AC6: a >=2-issue same-file cluster opens one real-GitHub-shaped PR per issue, stacked", () => {
+  it("completes without throwing; PR heads are dispatcher/<id>, pairwise distinct; bases stack predecessor -> successor", async () => {
+    const sameA = makeIssue("stack-a", 1, { priority: 1, predictedFiles: ["src/stacked.ts"] });
+    const sameB = makeIssue("stack-b", 1, { priority: 2, predictedFiles: ["src/stacked.ts"] });
+    const { port: linear } = createFakeLinear({ readyIssues: [sameA, sameB] });
+    const { port: worktree } = createFakeWorktree();
+    const { port: github, state: githubState } = createFakeGitHub();
+
+    const config = makeConfig();
+
+    // The assertion IS "does not throw" -- an unhandled rejection here (the
+    // pre-fix behavior against this hardened fake) fails the test directly.
+    const result = await runDispatcher(config, makeDeps({ linear, worktree, github }));
+
+    expect(githubState.prs).toHaveLength(2);
+
+    const heads = githubState.prs.map((pr) => pr.branch);
+    expect(new Set(heads).size).toBe(2);
+    expect(heads).toEqual(["dispatcher/stack-a", "dispatcher/stack-b"]);
+
+    const prByBranch = Object.fromEntries(githubState.prs.map((pr) => [pr.branch, pr]));
+    expect(prByBranch["dispatcher/stack-a"]?.base).toBe(config.basePrBranch);
+    expect(prByBranch["dispatcher/stack-b"]?.base).toBe("dispatcher/stack-a");
+
+    const outcomeById = Object.fromEntries(result.runLog.candidates.map((c) => [c.issueId, c.outcome]));
+    expect(outcomeById).toEqual({ "stack-a": "opened-pr", "stack-b": "opened-pr" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ALI-133 AC7 (retro-mandated): the fake's constraints have teeth, exercised
+// directly against `createFakeGitHub()` -- independent of the run loop.
+// Deleting either constraint from the fake makes its corresponding test fail.
+// ---------------------------------------------------------------------------
+
+describe("ALI-133 AC7: createFakeGitHub() enforces real GitHub's PR rules directly", () => {
+  it("a second openDraftPr for the same (branch, base) pair is rejected -- mirrors GitHub's 422", async () => {
+    const { port: github } = createFakeGitHub();
+    await github.pushBranch("/fake/path", "dispatcher/dup");
+
+    await github.openDraftPr({ branch: "dispatcher/dup", base: "main", title: "first", body: "" });
+
+    await expect(
+      github.openDraftPr({ branch: "dispatcher/dup", base: "main", title: "second", body: "" }),
+    ).rejects.toThrow(/pull request already exists/i);
+  });
+
+  it("an openDraftPr whose base was never pushed is rejected", async () => {
+    const { port: github } = createFakeGitHub();
+    await github.pushBranch("/fake/path", "dispatcher/orphan");
+
+    await expect(
+      github.openDraftPr({ branch: "dispatcher/orphan", base: "dispatcher/never-pushed", title: "t", body: "" }),
+    ).rejects.toThrow(/dispatcher\/never-pushed/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ALI-133 AC8: an abandoned (Needs Pedro) predecessor is never inherited.
+// ---------------------------------------------------------------------------
+
+describe("ALI-133 AC8: negative case -- an ambiguous predecessor is not inherited by the next issue", () => {
+  it("B forks from config.baseRef and its PR base is config.basePrBranch, not A's abandoned branch", async () => {
+    const issueA = makeIssue("aband-a", 1, { priority: 1, predictedFiles: ["src/abandoned.ts"] });
+    const issueB = makeIssue("aband-b", 1, { priority: 2, predictedFiles: ["src/abandoned.ts"] });
+    const { port: linear, state: linearState } = createFakeLinear({ readyIssues: [issueA, issueB] });
+    const { port: worktree, state: worktreeState } = createFakeWorktree();
+    const { port: github, state: githubState } = createFakeGitHub();
+    const { port: agent } = createFakeAgent((seat, ctx) => {
+      if (seat === "builder" && ctx.issue.id === "aband-a") {
+        return { summary: "found a gap", ambiguous: { question: "Which retry policy applies here?" } };
+      }
+      return { summary: "ok" };
+    });
+
+    const config = makeConfig();
+    const result = await runDispatcher(config, makeDeps({ linear, worktree, github, agent }));
+
+    // A went to Needs Pedro -- no PR for it.
+    const aChange = linearState.statusChanges.filter((c) => c.issueId === "aband-a").at(-1);
+    expect(aChange?.status).toBe("Needs Pedro");
+
+    // Exactly one PR opened this run -- B's.
+    expect(githubState.prs).toHaveLength(1);
+    expect(githubState.prs[0]?.branch).toBe("dispatcher/aband-b");
+    expect(githubState.prs[0]?.base).toBe(config.basePrBranch);
+
+    // B's fork used config.baseRef -- never A's abandoned branch, even
+    // though A precedes B in the same (same-file) cluster.
+    const forkForB = worktreeState.forked.find((f) => f.branch === "dispatcher/aband-b");
+    expect(forkForB?.baseRef).toBe(config.baseRef);
+    expect(forkForB?.baseRef).not.toBe("dispatcher/aband-a");
+
+    const bEntry = result.runLog.candidates.find((c) => c.issueId === "aband-b");
+    expect(bEntry?.outcome).toBe("opened-pr");
   });
 });
 
@@ -946,17 +1165,218 @@ describe("supplementary: an ambiguous issue goes to Needs Pedro (cycle cleared) 
 });
 
 // ---------------------------------------------------------------------------
-// supplementary: blind QA seat is always an explicit, loud skip
+// ALI-105: the blind test-author seat -- criteria 5-9
 // ---------------------------------------------------------------------------
 
-describe("supplementary: blind QA (ALI-105) is never a silent pass", () => {
-  it("every dispatched issue records blindQa as 'skipped (seat not built)'", async () => {
+// A body deliberately missing the "## Acceptance criteria" heading entirely.
+const NO_AC_HEADING_BODY = ["## Why", "", "stuff", "", "## What", "", "more stuff", ""].join("\n");
+
+// A body with the heading present but nothing under it before the next section.
+const EMPTY_AC_SECTION_BODY = ["## Acceptance criteria", "", "## Invariant", "", "holds", ""].join("\n");
+
+describe("ALI-105 criterion 5: blind QA dispatches for real -- no more hardcoded skip", () => {
+  it("every dispatched issue's blindQa seat is a real dispatch call, through dispatchBlindQa (never dispatch)", async () => {
     const issue = makeIssue("qa-check", 1);
     const { port: linear } = createFakeLinear({ readyIssues: [issue] });
-    const result = await runDispatcher(makeConfig(), makeDeps({ linear }));
+    const { port: agent, calls, blindCalls } = createFakeAgent();
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+
+    expect(blindCalls).toHaveLength(1);
+    expect(blindCalls[0]?.issueId).toBe("qa-check");
+    // Went through dispatchBlindQa, not dispatch() -- `calls` (dispatch()'s
+    // own call log) has no blindQa entry to find at all, by construction:
+    // `Seat` doesn't even include "blindQa" as a value.
+    expect(calls.filter((c) => c.issueId === "qa-check")).toHaveLength(2); // builder + reviewer only
+
     const entry = result.runLog.candidates.find((c) => c.issueId === "qa-check");
     const qaSeat = entry?.seats.find((s) => s.seat === "blindQa");
-    expect(qaSeat?.status).toBe("skipped (seat not built)");
+    expect(qaSeat?.status).toBe("ran");
+    // AC5's other half -- the retired status string no longer appearing
+    // anywhere in src/** (a repo grep returns no hits) -- is deliberately
+    // NOT re-typed here as a string literal: doing so would put a hit back
+    // into src/** and defeat the grep this test's own docstring relies on.
+    // Verified instead by `SeatOutcome["status"]`'s union (this file
+    // wouldn't typecheck if "ran" weren't a legal value) and recorded as a
+    // literal grep in the PR body.
+  });
+});
+
+describe("ALI-105 criterion 6: structural blindness -- the runtime half", () => {
+  it("the captured blind context's own keys are exactly the five allowed fields, all non-empty, and none of DispatchContext's fields", async () => {
+    const issue = makeIssue("blind-shape", 1, { predictedFiles: ["src/shape.ts"] });
+    const { port: linear } = createFakeLinear({ readyIssues: [issue] });
+    let captured: BlindDispatchContext | undefined;
+    const { port: agent } = createFakeAgent(undefined, async (ctx) => {
+      captured = ctx;
+      return { testFilesWritten: [], untestableCriteria: [] };
+    });
+
+    await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+
+    expect(captured).toBeDefined();
+
+    // (a) present and non-empty.
+    const ALLOWED_KEYS = ["issueId", "title", "acceptanceCriteria", "invariant", "definitionOfDone"] as const;
+    const actualKeys = Object.keys(captured as object).sort();
+    expect(actualKeys).toEqual([...ALLOWED_KEYS].sort());
+    for (const key of ALLOWED_KEYS) {
+      expect((captured as unknown as Record<string, unknown>)[key]).toBeTruthy();
+    }
+
+    // (b) absent -- asserted against the captured object's OWN keys, so a
+    // later field added to BlindDispatchContext by mistake fails this test
+    // rather than silently passing.
+    const FORBIDDEN_KEYS = ["worktreePath", "branch", "predictedFiles", "diff", "labels", "body"];
+    for (const key of FORBIDDEN_KEYS) {
+      expect(Object.prototype.hasOwnProperty.call(captured as object, key)).toBe(false);
+    }
+  });
+
+  it("DispatchContext is not assignable to BlindDispatchContext -- compile-time proof, enforced by npm run typecheck", () => {
+    // This function is declared, never called: the value under test is
+    // whether the line below type-checks, not any runtime behavior. If a
+    // future edit widens BlindDispatchContext (e.g. makes a field optional,
+    // or adds `worktreePath?`) such that the assignment below stops being
+    // an error, `@ts-expect-error` itself becomes an error ("unused
+    // ts-expect-error directive") and `npm run typecheck` goes red -- the
+    // proof is the compiler run, not this test's runtime assertion.
+    function neverCalled(ctx: DispatchContext): void {
+      // @ts-expect-error -- DispatchContext carries worktreePath/branch/enginePath/issue;
+      // BlindDispatchContext requires issueId/title/acceptanceCriteria/invariant/definitionOfDone,
+      // none of which DispatchContext has. Structural assignability must fail here.
+      const blind: BlindDispatchContext = ctx;
+      void blind;
+    }
+    expect(typeof neverCalled).toBe("function");
+  });
+});
+
+describe("ALI-105 criterion 7: unparseable criteria -- loud skip, never dispatched, run continues", () => {
+  it("no '## Acceptance criteria' heading at all: skipped (unparseable criteria), Linear comment posted, reviewer still runs", async () => {
+    const issue = makeIssue("no-ac-heading", 1, { body: NO_AC_HEADING_BODY });
+    const { port: linear, state: linearState } = createFakeLinear({ readyIssues: [issue] });
+    const { port: agent, calls, blindCalls } = createFakeAgent();
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+
+    const entry = result.runLog.candidates.find((c) => c.issueId === "no-ac-heading");
+    const qaSeat = entry?.seats.find((s) => s.seat === "blindQa");
+    expect(qaSeat?.status).toBe("skipped (unparseable criteria)");
+    expect(blindCalls).toEqual([]); // never dispatched -- not even attempted
+
+    const skipComment = linearState.comments.find(
+      (c) => c.issueId === "no-ac-heading" && /acceptance criteria/i.test(c.body),
+    );
+    expect(skipComment).toBeDefined();
+    expect(skipComment?.body).toContain("no-ac-heading");
+    expect(skipComment?.body).toMatch(/heading/i);
+
+    // Routing unchanged: continues straight to the reviewer, ends opened-pr.
+    expect(calls.some((c) => c.issueId === "no-ac-heading" && c.seat === "reviewer")).toBe(true);
+    expect(entry?.outcome).toBe("opened-pr");
+    const lastStatus = linearState.statusChanges.filter((c) => c.issueId === "no-ac-heading").at(-1);
+    expect(lastStatus?.status).toBe("In Review");
+  });
+
+  it("'## Acceptance criteria' heading present but empty: same loud skip, distinct reason text", async () => {
+    const issue = makeIssue("empty-ac", 1, { body: EMPTY_AC_SECTION_BODY });
+    const { port: linear, state: linearState } = createFakeLinear({ readyIssues: [issue] });
+    const { port: agent, blindCalls } = createFakeAgent();
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+
+    const entry = result.runLog.candidates.find((c) => c.issueId === "empty-ac");
+    const qaSeat = entry?.seats.find((s) => s.seat === "blindQa");
+    expect(qaSeat?.status).toBe("skipped (unparseable criteria)");
+    expect(blindCalls).toEqual([]);
+
+    const skipComment = linearState.comments.find(
+      (c) => c.issueId === "empty-ac" && /acceptance criteria/i.test(c.body),
+    );
+    expect(skipComment?.body).toMatch(/empty/i);
+    expect(entry?.outcome).toBe("opened-pr"); // never Needs Pedro, never Parked
+  });
+});
+
+describe("ALI-105 criterion 8: an untestable criterion is recorded and commented, routing unchanged", () => {
+  it("named by number in the seat detail and the seat-summary comment; never reroutes to Needs Pedro", async () => {
+    const issue = makeIssue("untestable-crit", 1);
+    const { port: linear, state: linearState } = createFakeLinear({ readyIssues: [issue] });
+    const { port: agent } = createFakeAgent(undefined, async () => ({
+      testFilesWritten: ["t1.blind.test.ts"],
+      untestableCriteria: [3],
+    }));
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+
+    const entry = result.runLog.candidates.find((c) => c.issueId === "untestable-crit");
+    const qaSeat = entry?.seats.find((s) => s.seat === "blindQa");
+    expect(qaSeat?.status).toBe("ran"); // recorded on a "ran" seat -- not a distinct status
+    expect(qaSeat?.detail).toContain("3");
+
+    // Routing unchanged: opened-pr, "In Review" -- never Needs Pedro (that
+    // path only ever reads the BUILDER's `ambiguous` field, never blindQa's).
+    expect(entry?.outcome).toBe("opened-pr");
+    const lastStatus = linearState.statusChanges.filter((c) => c.issueId === "untestable-crit").at(-1);
+    expect(lastStatus?.status).toBe("In Review");
+    expect(lastStatus?.status).not.toBe("Needs Pedro");
+
+    // Named by number in the seat-summary comment `finalizeOpenedPr` posts.
+    const openComment = linearState.comments.find(
+      (c) => c.issueId === "untestable-crit" && /blindQa/.test(c.body),
+    );
+    expect(openComment?.body).toContain("3");
+  });
+
+  it("multiple untestable criteria are all named, none dropped", async () => {
+    const issue = makeIssue("multi-untestable", 1);
+    const { port: linear } = createFakeLinear({ readyIssues: [issue] });
+    const { port: agent } = createFakeAgent(undefined, async () => ({
+      testFilesWritten: [],
+      untestableCriteria: [2, 5, 7],
+    }));
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+
+    const entry = result.runLog.candidates.find((c) => c.issueId === "multi-untestable");
+    const qaSeat = entry?.seats.find((s) => s.seat === "blindQa");
+    for (const n of [2, 5, 7]) expect(qaSeat?.detail).toContain(String(n));
+    expect(entry?.outcome).toBe("opened-pr");
+  });
+});
+
+describe("ALI-105 criterion 9: exactly one blindQa seat entry, enumerated status, for every completed issue", () => {
+  it("walks every candidate with outcome 'opened-pr' in a multi-issue run", async () => {
+    const clean = makeIssue("multi-clean", 1, { priority: 1, predictedFiles: ["a.ts"] });
+    const unparseable = makeIssue("multi-unparseable", 1, {
+      priority: 2,
+      predictedFiles: ["b.ts"],
+      body: NO_AC_HEADING_BODY,
+    });
+    const withDangerLabel = makeIssue("multi-danger", 1, {
+      priority: 3,
+      predictedFiles: ["c.ts"],
+      labels: ["payments"],
+    });
+    const { port: linear } = createFakeLinear({ readyIssues: [clean, unparseable, withDangerLabel] });
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear }));
+
+    const ENUMERATED_BLIND_QA_STATUSES = ["ran", "skipped (unparseable criteria)"];
+    const openedPrCandidates = result.runLog.candidates.filter((c) => c.outcome === "opened-pr");
+    expect(openedPrCandidates.length).toBeGreaterThan(0); // sanity: this run actually completed some
+
+    for (const candidate of openedPrCandidates) {
+      const qaSeats = candidate.seats.filter((s) => s.seat === "blindQa");
+      expect(qaSeats).toHaveLength(1);
+      expect(ENUMERATED_BLIND_QA_STATUSES).toContain(qaSeats[0]?.status);
+    }
+    // All three fixtures here fit the default 5-point budget individually
+    // and share no files/blockers -- every one should reach opened-pr.
+    expect(openedPrCandidates.map((c) => c.issueId).sort()).toEqual(
+      ["multi-clean", "multi-danger", "multi-unparseable"].sort(),
+    );
   });
 });
 
@@ -1039,5 +1459,68 @@ describe("supplementary: WorktreePort real adapter against a real throwaway git 
 
     await port.remove(handle);
     await expect(fs.stat(handle.path)).rejects.toThrow();
+  });
+
+  // ALI-133 AC9: real git, no cross-issue commits, and a dirty tree never
+  // leaks across a fork.
+  it("chained forkBranch calls carry no cross-issue commits, and a fresh fork discards a dirty tree", async () => {
+    const repoRoot = await fs.mkdtemp(join(tmpdir(), "ali133-repo-"));
+    tempDirs.push(repoRoot);
+    const worktreesDir = await fs.mkdtemp(join(tmpdir(), "ali133-worktrees-"));
+    tempDirs.push(worktreesDir);
+
+    await execFileAsync("git", ["init", "-q", "-b", "main"], { cwd: repoRoot });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: repoRoot });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: repoRoot });
+    await fs.writeFile(join(repoRoot, "README.md"), "hermetic fixture\n");
+    await execFileAsync("git", ["add", "README.md"], { cwd: repoRoot });
+    await execFileAsync("git", ["commit", "-q", "-m", "init"], { cwd: repoRoot });
+
+    const port = createGitWorktreePort(repoRoot, worktreesDir);
+    let handle = await port.createWorktree("scaffold", "main");
+
+    // dispatcher/a forks from main, commits one file.
+    handle = await port.forkBranch(handle, "dispatcher/a", "main");
+    await fs.writeFile(join(handle.path, "a.txt"), "issue a\n");
+    await execFileAsync("git", ["add", "a.txt"], { cwd: handle.path });
+    await execFileAsync("git", ["commit", "-q", "-m", "a"], { cwd: handle.path });
+
+    // dispatcher/b forks from dispatcher/a (not main) -- stacked, chained.
+    handle = await port.forkBranch(handle, "dispatcher/b", "dispatcher/a");
+    await fs.writeFile(join(handle.path, "b.txt"), "issue b\n");
+    await execFileAsync("git", ["add", "b.txt"], { cwd: handle.path });
+    await execFileAsync("git", ["commit", "-q", "-m", "b"], { cwd: handle.path });
+
+    const { stdout: revListOut } = await execFileAsync(
+      "git",
+      ["rev-list", "--count", "dispatcher/a..dispatcher/b"],
+      { cwd: handle.path },
+    );
+    expect(revListOut.trim()).toBe("1"); // exactly b's own commit -- none of a's
+
+    const { stdout: statusAfterB } = await execFileAsync("git", ["status", "--porcelain"], { cwd: handle.path });
+    expect(statusAfterB.trim()).toBe("");
+
+    // Dirty the working tree with an uncommitted, untracked leftover --
+    // simulates a builder that touched a file without committing it.
+    await fs.writeFile(join(handle.path, "stray.txt"), "uncommitted leftover\n");
+    const { stdout: statusDirty } = await execFileAsync("git", ["status", "--porcelain"], { cwd: handle.path });
+    expect(statusDirty.trim()).not.toBe("");
+
+    // dispatcher/c forks from main, with that dirty tree still present.
+    handle = await port.forkBranch(handle, "dispatcher/c", "main");
+
+    const { stdout: headSha } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: handle.path });
+    const { stdout: mainSha } = await execFileAsync("git", ["rev-parse", "main"], { cwd: repoRoot });
+    expect(headSha.trim()).toBe(mainSha.trim());
+
+    const { stdout: statusAfterC } = await execFileAsync("git", ["status", "--porcelain"], { cwd: handle.path });
+    expect(statusAfterC.trim()).toBe(""); // no leftovers from a/b, and the dirty file is gone
+
+    await expect(fs.stat(join(handle.path, "a.txt"))).rejects.toThrow();
+    await expect(fs.stat(join(handle.path, "b.txt"))).rejects.toThrow();
+    await expect(fs.stat(join(handle.path, "stray.txt"))).rejects.toThrow();
+
+    await port.remove(handle);
   });
 });
