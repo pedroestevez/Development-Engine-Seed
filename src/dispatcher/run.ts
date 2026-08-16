@@ -157,13 +157,30 @@ export interface RuntimeConfig {
   dispatcher: DispatcherConfig;
   backstop: BackstopConfig;
   /**
-   * The ref every PR this run opens targets, e.g. `"origin/main"` — a
-   * moving branch. Deliberately **not** the ref work worktrees branch from
-   * (ALI-104 AC3): that is the resolved pin, always. A PR opened against a
-   * commit rather than a branch could never be merged, so the two must
-   * never be collapsed even though both start as "some git ref".
+   * The git ref a cluster's *first* issue forks its per-issue branch from
+   * when it has no predecessor in this run, e.g. `"origin/main"` — a
+   * remote-tracking ref, valid for `git checkout`/`git worktree` but
+   * **not** something GitHub will accept as a PR `base` (that's
+   * `basePrBranch`, immediately below — the ALI-133 fix: real GitHub 422s
+   * on a `base` starting `origin/`). Deliberately **not** the ref the
+   * cluster's scaffold worktree branches from (ALI-104 AC3): that is
+   * always the resolved pin. A PR opened against a commit rather than a
+   * branch could never be merged, so pin / baseRef / basePrBranch must
+   * never collapse into each other even though all three are "some git
+   * ref" at a glance.
    */
   baseRef: string;
+  /**
+   * The GitHub branch name (e.g. `"main"`) a cluster's *first* issue's PR
+   * targets when it has no predecessor in this run — ALI-133 AC4. Distinct
+   * from `baseRef` on purpose: `baseRef` is a git ref `forkBranch` can fork
+   * a local branch from (including a remote-tracking ref like
+   * `"origin/main"`); `basePrBranch` is a value `openDraftPr`'s `base`
+   * hands to GitHub, which must be a real branch in the repo. The two
+   * happen to name "the same place" in practice, but only one of them is
+   * ever legal as a PR base.
+   */
+  basePrBranch: string;
   /**
    * Set only when resuming work a previous run parked. That prior run's
    * `runLog.engineSha` — the version `.claude/**` had when it parked. If
@@ -296,7 +313,7 @@ async function finalizeParked(
   issue: Issue,
   worktreeHandle: WorktreeHandle,
   deps: RunDeps,
-  config: RuntimeConfig,
+  prBase: string,
   engineSha: string,
   cycle: CycleRef,
   seats: SeatOutcome[],
@@ -307,7 +324,10 @@ async function finalizeParked(
   await deps.github.pushBranch(worktreeHandle.path, worktreeHandle.branch);
   const pr = await deps.github.openDraftPr({
     branch: worktreeHandle.branch,
-    base: config.baseRef,
+    // ALI-133 AC3: the predecessor's branch if one exists in this run, else
+    // `config.basePrBranch` — computed by the caller (the cluster lane
+    // loop), which is the only place that tracks pred(i).
+    base: prBase,
     title: `[parked] ${issue.id} ${issue.title}`,
     body: `${buildResumeNote(seats, resumePoint)}\n\nEngine SHA: ${engineSha}.`,
   });
@@ -342,7 +362,7 @@ async function finalizeOpenedPr(
   issue: Issue,
   worktreeHandle: WorktreeHandle,
   deps: RunDeps,
-  config: RuntimeConfig,
+  prBase: string,
   engineSha: string,
   cycle: CycleRef,
   seats: SeatOutcome[],
@@ -350,7 +370,10 @@ async function finalizeOpenedPr(
   await deps.github.pushBranch(worktreeHandle.path, worktreeHandle.branch);
   const pr = await deps.github.openDraftPr({
     branch: worktreeHandle.branch,
-    base: config.baseRef,
+    // ALI-133 AC3/AC4: predecessor's branch if pred(i) exists, else
+    // `config.basePrBranch` — a real GitHub branch name, never `baseRef`
+    // (which may be a remote-tracking ref GitHub would 422 on as a base).
+    base: prBase,
     title: `${issue.id}: ${issue.title}`,
     body: `Implements ${issue.id}. Engine SHA: ${engineSha}.`,
   });
@@ -372,6 +395,8 @@ async function dispatchOneIssue(
   config: RuntimeConfig,
   cycle: CycleRef,
   state: DispatchState,
+  /** ALI-133 AC3: this issue's PR base, already resolved by the caller (pred(i)'s branch, or config.basePrBranch). */
+  prBase: string,
 ): Promise<IssueDispatchResult> {
   const ctx: DispatchContext = {
     issue,
@@ -400,7 +425,7 @@ async function dispatchOneIssue(
 
   // Checkpoint 1/3 (AC5): after builder, before blind QA.
   if (isBeyondHard(deps.clock, config, state)) {
-    await finalizeParked(issue, worktreeHandle, deps, config, engineSha, cycle, seats, "after builder");
+    await finalizeParked(issue, worktreeHandle, deps, prBase, engineSha, cycle, seats, "after builder");
     return { hardKilled: true, outcome: "parked", seats, bounces, tokensUsed };
   }
 
@@ -415,7 +440,7 @@ async function dispatchOneIssue(
 
   // Checkpoint 2/3 (AC5): after reviewer, before security (or its skip).
   if (isBeyondHard(deps.clock, config, state)) {
-    await finalizeParked(issue, worktreeHandle, deps, config, engineSha, cycle, seats, "after reviewer");
+    await finalizeParked(issue, worktreeHandle, deps, prBase, engineSha, cycle, seats, "after reviewer");
     return { hardKilled: true, outcome: "parked", seats, bounces, tokensUsed };
   }
 
@@ -430,11 +455,11 @@ async function dispatchOneIssue(
 
   // Checkpoint 3/3 (AC5): after security (or its skip), before finalize.
   if (isBeyondHard(deps.clock, config, state)) {
-    await finalizeParked(issue, worktreeHandle, deps, config, engineSha, cycle, seats, "after security");
+    await finalizeParked(issue, worktreeHandle, deps, prBase, engineSha, cycle, seats, "after security");
     return { hardKilled: true, outcome: "parked", seats, bounces, tokensUsed };
   }
 
-  await finalizeOpenedPr(issue, worktreeHandle, deps, config, engineSha, cycle, seats);
+  await finalizeOpenedPr(issue, worktreeHandle, deps, prBase, engineSha, cycle, seats);
   return { hardKilled: false, outcome: "opened-pr", seats, bounces, tokensUsed };
 }
 
@@ -443,8 +468,25 @@ async function dispatchOneIssue(
 // parallel across clusters up to laneCount (AC6).
 // ---------------------------------------------------------------------------
 
-function branchNameFor(cluster: readonly Issue[]): string {
-  return `dispatcher/${cluster.map((issue) => issue.id).join("-")}`;
+/**
+ * ALI-133 AC1: one branch per issue, always — never per cluster. Every
+ * branch this run pushes, and every `branch`/`base` `openDraftPr` sees,
+ * names exactly one issue id.
+ */
+function branchNameFor(issue: Issue): string {
+  return `dispatcher/${issue.id}`;
+}
+
+/**
+ * The cluster's throwaway scaffold branch — the argument `createWorktree`
+ * gets to stand the shared worktree up in the first place. Deliberately
+ * namespaced away from `branchNameFor`'s per-issue output (`_scaffold/`)
+ * so it can never collide with a real issue id, and deliberately never
+ * passed to `pushBranch` or `openDraftPr` (AC1) — `forkBranch` moves the
+ * worktree onto the first issue's real branch before any work happens.
+ */
+function clusterScaffoldBranchNameFor(cluster: readonly Issue[]): string {
+  return `dispatcher/_scaffold/${cluster.map((issue) => issue.id).join("-")}`;
 }
 
 async function runClustersWithConcurrency(
@@ -658,6 +700,11 @@ export async function runDispatcher(config: RuntimeConfig, deps: RunDeps): Promi
   await runClustersWithConcurrency(runPlan.clusters, runPlan.laneCount, async (cluster) => {
     let worktreeHandle: WorktreeHandle | undefined;
     let clusterHardKilled = false;
+    // ALI-133: pred(i) — the branch of the nearest preceding issue in THIS
+    // cluster whose `openDraftPr` succeeded in THIS run. `undefined` until
+    // one does; an issue that goes to Needs Pedro (no PR) never sets this,
+    // so it can never be inherited by the next issue (AC8).
+    let predBranch: string | undefined;
 
     for (const issue of cluster) {
       if (state.hardKilled || state.softStopped) break; // leaves this + remaining issues "not-reached" below
@@ -673,15 +720,41 @@ export async function runDispatcher(config: RuntimeConfig, deps: RunDeps): Promi
       }
 
       if (!worktreeHandle) {
-        // Work worktrees branch FROM the resolved pin, not `config.baseRef`
-        // (ALI-104 AC3) -- `baseRef` is reserved for where PRs land, below.
-        worktreeHandle = await deps.worktree.createWorktree(branchNameFor(cluster), engineSha);
+        // The scaffold worktree still stands up FROM the resolved pin, not
+        // `config.baseRef` (ALI-104 AC3, preserved) -- its branch is a
+        // throwaway (ALI-133 AC1); the fork immediately below moves the
+        // worktree onto this issue's real branch before any work happens.
+        worktreeHandle = await deps.worktree.createWorktree(clusterScaffoldBranchNameFor(cluster), engineSha);
       }
+
+      // ALI-133 AC1/AC2: one branch per issue, chained. Forks from pred(i)'s
+      // branch if this run already opened one for a preceding issue in this
+      // cluster, else from `config.baseRef`. Must land before the builder
+      // is dispatched -- this call does exactly that, every time through
+      // the loop, for every issue.
+      const issueBranch = branchNameFor(issue);
+      const forkBase = predBranch ?? config.baseRef;
+      worktreeHandle = await deps.worktree.forkBranch(worktreeHandle, issueBranch, forkBase);
+
+      // ALI-133 AC3/AC4: the PR base is always a GitHub branch name, never
+      // a git ref -- pred(i)'s branch if it exists, else `basePrBranch`
+      // (never `baseRef`, which GitHub would reject as a PR base).
+      const prBase = predBranch ?? config.basePrBranch;
 
       await deps.linear.setIssueStatus(issue.id, "In Progress", cycle.id);
 
       const dispatchStartMs = deps.clock.now();
-      const result = await dispatchOneIssue(issue, worktreeHandle, enginePath, engineSha, deps, config, cycle, state);
+      const result = await dispatchOneIssue(
+        issue,
+        worktreeHandle,
+        enginePath,
+        engineSha,
+        deps,
+        config,
+        cycle,
+        state,
+        prBase,
+      );
       const entry = mustGetLedger(ledger, issue.id);
       entry.seats = result.seats;
       entry.bounces = result.bounces;
@@ -691,6 +764,14 @@ export async function runDispatcher(config: RuntimeConfig, deps: RunDeps): Promi
         tokensUsed: result.tokensUsed,
       };
       state.totalTokensUsed += result.tokensUsed;
+
+      // pred(i+1) becomes this issue exactly when this issue's PR actually
+      // opened -- "opened-pr" (normal) and "parked" (hard-killed, but
+      // `finalizeParked` still calls `openDraftPr`) both count; "needs-pedro"
+      // does not (AC8: an abandoned predecessor is never inherited).
+      if (result.outcome === "opened-pr" || result.outcome === "parked") {
+        predBranch = issueBranch;
+      }
 
       if (result.hardKilled) {
         state.hardKilled = true;
