@@ -1,8 +1,9 @@
 name: CI
 
-# The Amendment gate's CI half (docs/GATES.md). Runs on every PR against
-# main and on every push to main, so no change to this repo — engine file
-# or otherwise — lands without at least these checks having run.
+# The Amendment gate's CI half (docs/GATES.md). Runs on every pull request
+# whatever its base branch (default activity types), and on every push to
+# main, so no change to this repo — engine file or otherwise — lands without
+# at least these checks having run.
 on:
   pull_request:
   push:
