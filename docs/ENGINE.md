@@ -135,6 +135,8 @@ This is not a metrics system; it's the Planner reading the loop's own logs (the 
 
 Each metric maps to one knob: bounces → model tier or spec strictness; escalations → feature-definition or infra; escape → a missing acceptance criterion (add it so the Reviewer catches that whole class next time). Fix the **loudest one** each retro. **Cost** (the Max usage cap) is a budget watched separately — never folded into the velocity definition.
 
+**Bounces, made measurable (ALI-106):** the run log's `bounces[]` is structured (`detectedAtStage`, `detectorSeat`, `detectorTokens`, `reworkTokens`, `reason`), not the bare count this section's "bounces → model tier" knob used to read blind. §9's calibration loop is where that structure gets computed on — see "The calibration loop" there for the exact metrics, the budget ramp rule, and the two model-tier hypotheses (T and L) it arbitrates.
+
 ---
 
 ## 9. Forecasting
@@ -144,6 +146,25 @@ Each metric maps to one knob: bounces → model tier or spec strictness; escalat
 - The cadence limiter is **Pedro** (define + approve), not the agents — which is why 1–3 day cycles fit.
 - Forecast to a **frozen cut line** (a product's "first-wave" issue set), not "done."
 - **weeks-to-first-wave ≈ (remaining MVP points ÷ velocity) × cycle length.** The first BA pass — pointing the backlog — supplies the numerator.
+
+### The calibration loop (ALI-106) — a story point is a measured unit, not a guess
+
+"Estimates are wrong" is true on day one and stays true forever unless something measures the error and corrects it. Story points measure *human-perceived effort*; what an agent run actually consumes is context and tokens, which track *files touched × unfamiliarity*, not effort. The run log (`src/dispatcher/runlog.ts`) carries the fields to close that gap — per issue, `points`/`weightedCost` (the estimate), `actualConsumption` (the theory-free actual: wall-clock + tokens), `seats[]` (what each seat *actually* ran at — model, effort, tokens, wall-clock — never the routing table's prediction), `bounces[]` (structured: `round`, `detectedAtStage`, `detectorSeat`, `detectorTokens`, `reworkTokens`, `reason` — never a bare count), and `risk` (`labels`, `points`, `verifierTier` — the tier verification actually ran at). `src/dispatcher/calibration.ts` computes on this, pure functions over `RunLog[]`, no I/O.
+
+**Three metrics, computed exactly as follows (mirrored in `planner.md`'s Calibration loop section):**
+
+1. **Points-to-cost ratio per point value** — the median `actualConsumption.tokensUsed` across every dispatched candidate at each point value. If a lower point value's median cost exceeds a higher one's, the scale is being applied inconsistently — the retro names the exact pair, not a vibe.
+2. **Backstop-fire rate** — the fraction of runs whose `stopReason` is `backstop-wallclock` or `backstop-tokens`. **Target: under 20%.** Above that, the retro must say which of two things is true — budget too high, or estimates systematically low — and `recommendBudgetChange` decides between **lower the budget** and **re-point** by checking metric 1's internal consistency, never recommending both vaguely.
+3. **Budget headroom** — average unused budget fraction on runs that finished naturally (`stopReason: cycle-empty`, zero backstop fires — a "clean run"). **The ramp rule: three consecutive clean runs is the trigger to raise the budget by 1.**
+
+**Budget starts at 5** (`DEFAULT_CONFIG.budget`, `src/dispatcher/types.ts`). **The planner recommends; it never applies.** `calibration.ts` exports only descriptive values (a recommendation string plus evidence) and imports no filesystem or process API — there is no write path from the planner's tools to the budget's config. Changing `DEFAULT_CONFIG.budget` is an engine change like any other: it goes through the **Amendment gate** (§16) — a human-merged commit, same discipline as every other change to `.claude/**`, `CLAUDE.md`, or this document.
+
+**Two stated hypotheses — falsifiable, not settled policy.** The retro reports *on* these every cycle, with `n` and a verdict (`"insufficient data"` is a valid, expected answer, not a gap to smooth over):
+
+- **Hypothesis T — judgment at the gates, cheap builders downstream.** A sharp spec plus a cheap builder beats a vague spec plus an expensive one, because bounces dominate cost. *Falsified if:* cheap-tier seats show a bounce rate high enough that `cheap_tokens + rework_tokens > expensive_tokens` at equal outcome quality.
+- **Hypothesis L — the escalation ladder only pays on cheap detection.** A bounce round costs roughly as much as the original build, so the ladder only pays where rejection is detected cheaply (lint stage, not judgment stage): ladder cost is `C_cheap + p·(C_detect + C_expensive)` against always-expensive's `C_expensive`; the ladder wins only when `C_cheap + p·C_detect < (1 − p)·C_expensive`. If detection itself requires the expensive judgment seat (`C_detect ≈ C_expensive`), the inequality essentially never holds — the ladder is strictly worse than skipping it. *Falsified if:* ladder runs whose rejection was detected at judgment stage nonetheless came out cheaper than a single expensive run.
+
+The ladder's precondition (*is rejection cheaply detectable?*) is the same question as the cheap-tier precondition (*is output verifiable downstream?*) — one test decides tier, retry policy, and whether a seat should be split. **Split-seat** (how a review is structured: mechanical → cheap lint, judgment → top tier) and **verify-by-risk** (ALI-152: the verifier's tier comes from the issue's labels, not from whatever built it) are orthogonal and compose — neither replaces the other; `risk.verifierTier` in the run log exists so a run where verify-by-risk applied is distinguishable from one where only split-seat did.
 
 ---
 

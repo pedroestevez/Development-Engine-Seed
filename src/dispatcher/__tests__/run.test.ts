@@ -1137,6 +1137,201 @@ describe("criterion 11: verdict vocabulary maps 1:1 onto admitted + DeferralReas
 });
 
 // ---------------------------------------------------------------------------
+// ALI-106: the amended run-log schema -- seats[] records what actually ran
+// (never the routing table's prediction), bounces[] is structured, and
+// risk.verifierTier is derived from real seat reports.
+// ---------------------------------------------------------------------------
+
+describe("ALI-106 AC1.3: seats[] records what actually ran, not the routing table's prediction", () => {
+  it("a 1-point issue predicts pointsTier=haiku, but the builder reports it ran at opus -- the log shows opus", async () => {
+    const issue = makeIssue("tier-mismatch", 1, { priority: 1 });
+    const { port: linear } = createFakeLinear({ readyIssues: [issue] });
+    const { port: agent } = createFakeAgent((seat) => {
+      if (seat === "builder") return { summary: "ok", model: "opus", tokensUsed: 500 };
+      return { summary: "ok", model: "sonnet", tokensUsed: 100 };
+    });
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+    const entry = result.runLog.candidates.find((c) => c.issueId === "tier-mismatch");
+
+    // The routing table's own prediction, unchanged -- haiku for a 1-point issue.
+    expect(entry?.tier.tier).toBe("haiku");
+
+    // What actually ran, per seats[] -- opus, sourced from the agent's own report.
+    const builderSeat = entry?.seats.find((s) => s.seat === "builder");
+    expect(builderSeat?.model).toBe("opus");
+    expect(builderSeat?.tokens).toBe(500);
+    expect(builderSeat?.effort).toBe("standard");
+    expect(builderSeat?.wallClockMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("every ran seat carries a wallClockMs, and a skipped seat carries none", async () => {
+    const issue = makeIssue("wallclock-check", 1, { priority: 1, labels: ["payments"] });
+    const { port: linear } = createFakeLinear({ readyIssues: [issue] });
+    const clock = createFakeClock(0);
+    const { port: agent } = createFakeAgent(
+      (seat) => {
+        clock.advance(10);
+        return { summary: "ok", model: "sonnet", tokensUsed: 10 };
+      },
+      (ctx) => {
+        clock.advance(10);
+        return { testFilesWritten: [`${ctx.issueId}.blind.test.ts`], untestableCriteria: [] };
+      },
+    );
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent, clock }));
+    const entry = result.runLog.candidates.find((c) => c.issueId === "wallclock-check");
+
+    for (const seat of ["builder", "blindQa", "reviewer", "security"] as const) {
+      const s = entry?.seats.find((x) => x.seat === seat);
+      expect(s?.status).toBe("ran");
+      expect(s?.wallClockMs).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("ALI-106 AC1.2: bounces[] is structured, not a count", () => {
+  it("a reviewer bounce records round, detectedAtStage, detectorSeat, detectorTokens, reworkTokens, and reason", async () => {
+    const issue = makeIssue("bounce-check", 1, { priority: 1 });
+    const { port: linear } = createFakeLinear({ readyIssues: [issue] });
+    const { port: agent } = createFakeAgent((seat) => {
+      if (seat === "reviewer") {
+        return {
+          summary: "found a lint failure",
+          bounced: true,
+          bounceDetail: {
+            detectedAtStage: "lint",
+            detectorTokens: 50,
+            reworkTokens: 200,
+            reason: "eslint: unused import",
+          },
+          tokensUsed: 50,
+        };
+      }
+      return { summary: "ok" };
+    });
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+    const entry = result.runLog.candidates.find((c) => c.issueId === "bounce-check");
+
+    expect(entry?.bounces).toEqual([
+      {
+        round: 1,
+        detectedAtStage: "lint",
+        detectorSeat: "reviewer",
+        detectorTokens: 50,
+        reworkTokens: 200,
+        reason: "eslint: unused import",
+      },
+    ]);
+  });
+
+  it("multiple bounces across seats are recorded in order, 1-indexed", async () => {
+    const issue = makeIssue("multi-bounce", 1, { priority: 1, labels: ["payments"] });
+    const { port: linear } = createFakeLinear({ readyIssues: [issue] });
+    const { port: agent } = createFakeAgent((seat) => {
+      if (seat === "builder") {
+        return {
+          summary: "internal rework",
+          bounced: true,
+          bounceDetail: { detectedAtStage: "judgment", detectorTokens: 10, reworkTokens: 30, reason: "self-caught bug" },
+        };
+      }
+      if (seat === "security") {
+        return {
+          summary: "found an authz gap",
+          bounced: true,
+          bounceDetail: { detectedAtStage: "judgment", detectorTokens: 20, reworkTokens: 60, reason: "missing authz check" },
+        };
+      }
+      return { summary: "ok" };
+    });
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+    const entry = result.runLog.candidates.find((c) => c.issueId === "multi-bounce");
+
+    expect(entry?.bounces.map((b) => b.round)).toEqual([1, 2]);
+    expect(entry?.bounces.map((b) => b.detectorSeat)).toEqual(["builder", "security"]);
+  });
+
+  it("bounced: true without bounceDetail falls back to the conservative (judgment-stage) default, never guessed cheap", async () => {
+    const issue = makeIssue("bounce-no-detail", 1, { priority: 1 });
+    const { port: linear } = createFakeLinear({ readyIssues: [issue] });
+    const { port: agent } = createFakeAgent((seat) => {
+      if (seat === "reviewer") return { summary: "bounced, no detail", bounced: true, tokensUsed: 30 };
+      return { summary: "ok" };
+    });
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+    const entry = result.runLog.candidates.find((c) => c.issueId === "bounce-no-detail");
+
+    expect(entry?.bounces).toHaveLength(1);
+    expect(entry?.bounces[0]?.detectedAtStage).toBe("judgment");
+    expect(entry?.bounces[0]?.detectorSeat).toBe("reviewer");
+  });
+
+  it("no bounce reported -- bounces[] is an empty array, never left as a bare count", async () => {
+    const issue = makeIssue("no-bounce", 1, { priority: 1 });
+    const { port: linear } = createFakeLinear({ readyIssues: [issue] });
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear }));
+    const entry = result.runLog.candidates.find((c) => c.issueId === "no-bounce");
+    expect(entry?.bounces).toEqual([]);
+  });
+});
+
+describe("ALI-106 AC1.4: risk.verifierTier distinguishes what verification actually ran at", () => {
+  it("a danger-labeled issue whose reviewer reports opus -- verifierTier is opus, matching the risk floor", async () => {
+    const issue = makeIssue("risky-verify", 1, { priority: 1, labels: ["payments"] });
+    const { port: linear } = createFakeLinear({ readyIssues: [issue] });
+    const { port: agent } = createFakeAgent((seat) => {
+      if (seat === "reviewer" || seat === "security") return { summary: "ok", model: "opus" };
+      return { summary: "ok", model: "sonnet" };
+    });
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+    const entry = result.runLog.candidates.find((c) => c.issueId === "risky-verify");
+
+    expect(entry?.risk).toEqual({ labels: ["payments"], points: 1, verifierTier: "opus" });
+  });
+
+  it("a plain issue whose reviewer reports sonnet, security skipped -- verifierTier is sonnet (max of what ran, not what was predicted)", async () => {
+    const issue = makeIssue("plain-verify", 2, { priority: 1 });
+    const { port: linear } = createFakeLinear({ readyIssues: [issue] });
+    const { port: agent } = createFakeAgent((seat) => {
+      if (seat === "reviewer") return { summary: "ok", model: "sonnet" };
+      return { summary: "ok" };
+    });
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear, agent }));
+    const entry = result.runLog.candidates.find((c) => c.issueId === "plain-verify");
+    expect(entry?.risk.verifierTier).toBe("sonnet");
+  });
+
+  it("a candidate never dispatched (deferred) keeps verifierTier 'none' and carries its own labels/points", async () => {
+    // "fits-alone" (5pt, no danger label -> weighted cost 5) fills the
+    // default budget (5) by itself, exactly as criterion 2's own fixture
+    // does -- leaving "never-runs" (4pt) with nothing left to fit into.
+    const admitted = makeIssue("fits-alone", 5, { priority: 1 });
+    const deferred = makeIssue("never-runs", 4, { priority: 2 });
+    const { port: linear } = createFakeLinear({ readyIssues: [admitted, deferred] });
+
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear }));
+    const entry = result.runLog.candidates.find((c) => c.issueId === "never-runs");
+    expect(entry?.outcome).toBe("not-dispatched");
+    expect(entry?.risk).toEqual({ labels: [], points: 4, verifierTier: "none" });
+  });
+
+  it("no reported model at all (fixtures that never set one) -- verifierTier stays 'none', never guessed", async () => {
+    const issue = makeIssue("no-model-reported", 1, { priority: 1 });
+    const { port: linear } = createFakeLinear({ readyIssues: [issue] });
+    const result = await runDispatcher(makeConfig(), makeDeps({ linear })); // default fake agent reports no model
+    const entry = result.runLog.candidates.find((c) => c.issueId === "no-model-reported");
+    expect(entry?.risk.verifierTier).toBe("none");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // supplementary: per-issue ambiguity ("never guess") does not stop the run
 // ---------------------------------------------------------------------------
 

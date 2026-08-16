@@ -40,7 +40,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { extractBlindView, type BlindDispatchContext } from "./blindqa.js";
 import { hasDangerLabel, plan, weightedCost } from "./plan.js";
-import type { DispatcherConfig, Issue, RunPlan } from "./types.js";
+import type { DispatcherConfig, Issue, ModelTier, RunPlan } from "./types.js";
 import {
   checkStatusDrift,
   statusDriftMessage,
@@ -51,15 +51,19 @@ import {
 import type { DraftPrResult, EnginePinPort, GitHubPort, WorktreeHandle, WorktreePort } from "./worktree.js";
 import {
   deferralReasonToVerdict,
+  deriveVerifierTier,
   redact,
   renderCycleSummary,
   scrubSecrets,
   serializeRunLog,
+  type BounceRecord,
+  type BounceStage,
   type CandidateLogEntry,
   type ClusterLogEntry,
   type IssueOutcome,
   type RedactedCredentials,
   type RunLog,
+  type SeatEffort,
   type SeatName,
   type SeatOutcome,
   type StopReason,
@@ -87,13 +91,43 @@ export interface DispatchContext {
   enginePath: string;
 }
 
+/**
+ * ALI-106 AC1.2: the structured detail behind one `bounced: true` result.
+ * Optional on `AgentDispatchResult` for the same reason `ambiguous` is —
+ * not every fixture or real dispatch adapter will populate it — but when
+ * absent, `dispatchOneIssue`'s bounce recording falls back to a
+ * conservative default (`detectedAtStage: "judgment"`, the more expensive
+ * assumption) rather than guessing cheap, so a caller that forgets this
+ * field never accidentally makes the ladder look better than it is.
+ */
+export interface BounceDetail {
+  detectedAtStage: BounceStage;
+  /** Tokens the detecting pass itself consumed (finding the defect). */
+  detectorTokens: number;
+  /** Tokens the rework/rebuild that followed consumed (fixing it). */
+  reworkTokens: number;
+  reason: string;
+}
+
 export interface AgentDispatchResult {
   summary: string;
   /** This stage required a bounce (rework round) — counted, not itself re-looped by this runtime. */
   bounced?: boolean;
+  /** Structured detail for a `bounced: true` result (ALI-106 AC1.2) — see `BounceDetail`. */
+  bounceDetail?: BounceDetail;
   /** Set when the seat found an unresolvable ambiguity — "never guess" (CLAUDE.md conduct rule). */
   ambiguous?: { question: string };
   tokensUsed?: number;
+  /**
+   * ALI-106 AC1.3/AC3: the model tier this dispatch call *actually* ran at,
+   * as the agent itself reports it — never derived from the routing
+   * table's prediction (`RunPlan.tiers`). The run log records exactly this
+   * value, which is what lets a fixture prove a seat ran at a different
+   * tier than predicted and have the log show what ran.
+   */
+  model?: ModelTier;
+  /** ALI-106: the effort level this dispatch call ran at (see `SeatEffort`). */
+  effort?: SeatEffort;
 }
 
 /**
@@ -110,6 +144,10 @@ export interface BlindQaDispatchResult {
   /** Acceptance-criterion numbers the seat could not write a test for (AC3, AC8) — never guessed, always named. */
   untestableCriteria: number[];
   tokensUsed?: number;
+  /** ALI-106 AC1.3: the model tier this dispatch call actually ran at — same discipline as `AgentDispatchResult.model`. */
+  model?: ModelTier;
+  /** ALI-106: the effort level this dispatch call ran at (see `SeatEffort`). The blind seat is never split-seat, so this is always `"standard"` today — carried for schema uniformity across every seat. */
+  effort?: SeatEffort;
 }
 
 /**
@@ -325,9 +363,14 @@ function buildCandidateLedger(runPlan: RunPlan): Map<string, CandidateLogEntry> 
       verdict,
       tier,
       seats: [],
-      bounces: 0,
+      bounces: [],
       outcome: "not-dispatched",
       estimatedConsumption: { weightedCost: weightedCost(issue, runPlan.config) },
+      // ALI-106 AC1.4: seeded "none" (no verifying seat has run yet) and
+      // updated to `deriveVerifierTier(result.seats)` once dispatch
+      // finishes — see the cluster lane loop below. A candidate that never
+      // dispatches (deferred, not-reached) correctly keeps "none" forever.
+      risk: { labels: issue.labels, points: issue.points, verifierTier: "none" },
     });
   };
 
@@ -345,8 +388,16 @@ interface IssueDispatchResult {
   hardKilled: boolean;
   outcome: IssueOutcome;
   seats: SeatOutcome[];
-  bounces: number;
+  /** ALI-106 AC1.2: structured, not a count — see `BounceRecord`. */
+  bounces: BounceRecord[];
   tokensUsed: number;
+}
+
+/** Times one seat dispatch call against `deps.clock` — the source for `SeatOutcome.wallClockMs` (ALI-106). */
+async function timedDispatch<T>(clock: Clock, fn: () => Promise<T>): Promise<{ result: T; wallClockMs: number }> {
+  const start = clock.now();
+  const result = await fn();
+  return { result, wallClockMs: clock.now() - start };
 }
 
 const SEAT_ORDER: readonly SeatName[] = ["builder", "blindQa", "reviewer", "security"];
@@ -458,18 +509,48 @@ async function dispatchOneIssue(
     enginePath,
   };
   const seats: SeatOutcome[] = [];
-  let bounces = 0;
+  // ALI-106 AC1.2: structured records, not a count -- one entry per bounce,
+  // pushed by `record()` below in detection order (`round` is that array's
+  // 1-indexed position).
+  const bounces: BounceRecord[] = [];
   let tokensUsed = 0;
 
-  const record = (result: AgentDispatchResult): void => {
+  // ALI-106: `seat` identifies which seat's dispatch call this result came
+  // from -- `detectorSeat` on any bounce it reports, and the only thing
+  // that lets a bounce be attributed to the pass that found it. Falls back
+  // to `detectedAtStage: "judgment"` (the more expensive assumption, never
+  // the cheaper one) when a fixture/adapter sets `bounced: true` without
+  // `bounceDetail`, so an incomplete report never makes the ladder look
+  // better than it is.
+  const record = (seat: SeatName, result: AgentDispatchResult): void => {
     tokensUsed += result.tokensUsed ?? 0;
-    if (result.bounced) bounces++;
+    if (result.bounced) {
+      const detail = result.bounceDetail;
+      bounces.push({
+        round: bounces.length + 1,
+        detectedAtStage: detail?.detectedAtStage ?? "judgment",
+        detectorSeat: seat,
+        detectorTokens: detail?.detectorTokens ?? result.tokensUsed ?? 0,
+        reworkTokens: detail?.reworkTokens ?? 0,
+        reason: detail?.reason ?? "(unspecified -- bounced without bounceDetail)",
+      });
+    }
   };
 
   // Stage 1: builder.
-  const builderResult = await deps.agent.dispatch("builder", ctx);
-  record(builderResult);
-  seats.push({ seat: "builder", status: "ran", detail: builderResult.summary });
+  const { result: builderResult, wallClockMs: builderWallClockMs } = await timedDispatch(deps.clock, () =>
+    deps.agent.dispatch("builder", ctx),
+  );
+  record("builder", builderResult);
+  seats.push({
+    seat: "builder",
+    status: "ran",
+    detail: builderResult.summary,
+    model: builderResult.model,
+    effort: builderResult.effort ?? "standard",
+    tokens: builderResult.tokensUsed,
+    wallClockMs: builderWallClockMs,
+  });
 
   if (builderResult.ambiguous) {
     await finalizeNeedsPedro(issue, deps, engineSha, builderResult.ambiguous.question);
@@ -501,7 +582,9 @@ async function dispatchOneIssue(
         "continues to the reviewer.",
     );
   } else {
-    const blindResult = await deps.agent.dispatchBlindQa(blindView.context);
+    const { result: blindResult, wallClockMs: blindWallClockMs } = await timedDispatch(deps.clock, () =>
+      deps.agent.dispatchBlindQa(blindView.context),
+    );
     tokensUsed += blindResult.tokensUsed ?? 0;
     const detailParts = [`${blindResult.testFilesWritten.length} test file(s) written`];
     if (blindResult.untestableCriteria.length > 0) {
@@ -511,13 +594,31 @@ async function dispatchOneIssue(
       // (that branch only ever reads `builderResult.ambiguous`, above).
       detailParts.push(`untestable criteria: ${blindResult.untestableCriteria.join(", ")}`);
     }
-    seats.push({ seat: "blindQa", status: "ran", detail: detailParts.join("; ") });
+    seats.push({
+      seat: "blindQa",
+      status: "ran",
+      detail: detailParts.join("; "),
+      model: blindResult.model,
+      effort: blindResult.effort ?? "standard",
+      tokens: blindResult.tokensUsed,
+      wallClockMs: blindWallClockMs,
+    });
   }
 
   // Stage 3: reviewer.
-  const reviewerResult = await deps.agent.dispatch("reviewer", ctx);
-  record(reviewerResult);
-  seats.push({ seat: "reviewer", status: "ran", detail: reviewerResult.summary });
+  const { result: reviewerResult, wallClockMs: reviewerWallClockMs } = await timedDispatch(deps.clock, () =>
+    deps.agent.dispatch("reviewer", ctx),
+  );
+  record("reviewer", reviewerResult);
+  seats.push({
+    seat: "reviewer",
+    status: "ran",
+    detail: reviewerResult.summary,
+    model: reviewerResult.model,
+    effort: reviewerResult.effort ?? "standard",
+    tokens: reviewerResult.tokensUsed,
+    wallClockMs: reviewerWallClockMs,
+  });
 
   // Checkpoint 2/3 (AC5): after reviewer, before security (or its skip).
   if (isBeyondHard(deps.clock, config, state)) {
@@ -527,9 +628,19 @@ async function dispatchOneIssue(
 
   // Stage 4: security -- conditional on a danger label.
   if (hasDangerLabel(issue.labels)) {
-    const securityResult = await deps.agent.dispatch("security", ctx);
-    record(securityResult);
-    seats.push({ seat: "security", status: "ran", detail: securityResult.summary });
+    const { result: securityResult, wallClockMs: securityWallClockMs } = await timedDispatch(deps.clock, () =>
+      deps.agent.dispatch("security", ctx),
+    );
+    record("security", securityResult);
+    seats.push({
+      seat: "security",
+      status: "ran",
+      detail: securityResult.summary,
+      model: securityResult.model,
+      effort: securityResult.effort ?? "standard",
+      tokens: securityResult.tokensUsed,
+      wallClockMs: securityWallClockMs,
+    });
   } else {
     seats.push({ seat: "security", status: "skipped (not applicable)" });
   }
@@ -844,6 +955,9 @@ export async function runDispatcher(config: RuntimeConfig, deps: RunDeps): Promi
         wallClockMs: deps.clock.now() - dispatchStartMs,
         tokensUsed: result.tokensUsed,
       };
+      // ALI-106 AC1.4: derived from what actually ran (result.seats), not
+      // from the routing table -- same discipline as `SeatOutcome.model`.
+      entry.risk = { ...entry.risk, verifierTier: deriveVerifierTier(result.seats) };
       state.totalTokensUsed += result.tokensUsed;
 
       // pred(i+1) becomes this issue exactly when this issue's PR actually
