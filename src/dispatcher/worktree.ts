@@ -30,9 +30,29 @@ export interface WorktreePort {
    * Creates a worktree for `branch` off `baseRef`. One per cluster — call
    * once per cluster and reuse the handle for every issue in it (same
    * files → one routine, sequential; ALI-102's `partition()` already
-   * guarantees that grouping).
+   * guarantees that grouping). The branch this creates is a throwaway
+   * scaffold (ALI-133 AC1) — `forkBranch` below immediately moves the
+   * worktree onto the first issue's real branch before any work happens, so
+   * this call's branch is never pushed and never used as a PR head or base.
    */
   createWorktree(branch: string, baseRef: string): Promise<WorktreeHandle>;
+  /**
+   * ALI-133: the per-issue branch operation. Moves an existing worktree, in
+   * place, onto `branch` (created or reset to point at `baseRef`) —
+   * `handle.path` never changes, only what's checked out into it. This is
+   * how one shared cluster worktree carries a different branch for each
+   * issue in turn: called once per issue, immediately before that issue's
+   * builder is dispatched (AC2), with `baseRef` set to the predecessor
+   * issue's branch if one exists in this run, else `config.baseRef`
+   * (stacked PR bases — see `run.ts`'s cluster lane loop).
+   *
+   * Discards whatever the worktree held before the call — any uncommitted
+   * modifications, any untracked leftover files — so the working tree is
+   * guaranteed clean afterward, matching `baseRef`'s tree exactly (AC2,
+   * AC9). This is deliberate: an issue's fork point must never carry
+   * unrelated debris left behind by a differently-scoped predecessor.
+   */
+  forkBranch(handle: WorktreeHandle, branch: string, baseRef: string): Promise<WorktreeHandle>;
   /**
    * Marks a worktree as must-survive. On the hard-kill path this is called
    * *before* anything else — the worktree must never be deleted once work
@@ -107,6 +127,21 @@ export function createGitWorktreePort(repoRoot: string, worktreesDir: string): W
       const path = `${worktreesDir}/${branch.replace(/[^A-Za-z0-9_.-]/g, "-")}`;
       await execFileAsync("git", ["worktree", "add", path, "-b", branch, baseRef], { cwd: repoRoot });
       return { path, branch };
+    },
+    async forkBranch(handle, branch, baseRef) {
+      // -f/--force: proceed even though the working tree may hold a
+      // predecessor issue's uncommitted debris -- this call's whole job is
+      // to discard that, not preserve it (AC2, AC9).
+      await execFileAsync("git", ["checkout", "-f", "-B", branch, baseRef], { cwd: handle.path });
+      // Belt-and-braces: checkout -f already makes tracked files match
+      // baseRef's tree, but reset --hard guarantees index + working tree
+      // are byte-identical to it regardless of what path checkout took.
+      await execFileAsync("git", ["reset", "--hard", baseRef], { cwd: handle.path });
+      // Untracked leftovers (e.g. a builder that touched but never
+      // committed a file) survive both of the above -- clean removes them
+      // so `git status --porcelain` is empty afterward.
+      await execFileAsync("git", ["clean", "-fd"], { cwd: handle.path });
+      return { path: handle.path, branch };
     },
     async preserve() {
       // A git worktree already survives on disk until explicitly removed —
