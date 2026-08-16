@@ -49,6 +49,36 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# SECURITY -- finding S5 (ALI-137 / PR #14 security pass), closed by ALI-144.
+# Every action reference below is pinned to a full 40-char COMMIT SHA, not a tag.
+#
+# A tag is a mutable pointer. `actions/checkout@v4` means "whatever v4 names
+# when the run starts" -- so a maintainer or tag compromise that re-points v4
+# executes in all four jobs, ahead of any npm command. That is precisely the
+# tj-actions/changed-files incident (CVE-2025-30066): the Action itself was
+# compromised by re-pointing its version tags at malicious code. `--ignore-
+# scripts` (ALI-137) is irrelevant to it -- that control bounds npm lifecycle
+# hooks, and the Action runs before npm does. A commit SHA is immutable, so
+# the code this workflow runs is now fixed to what was reviewed at pin time.
+#
+# GitHub's own `actions/*` org is NOT a safety property here: the pin covers
+# every reference regardless of author, so the invariant cannot be argued down
+# to "no third-party actions, nothing to do."
+#
+# Resolved 2026-08-16, each by two independent reads of GitHub's ref database
+# (`git ls-remote`, then a `git fetch` of the tag confirming the commit it
+# actually delivers). Both mutable `v4` tags pointed at their repo's v4.4.0,
+# and both are lightweight tags, so the ref is the commit SHA directly:
+#
+#   actions/checkout   v4 -> v4.4.0  11d5960a326750d5838078e36cf38b85af677262
+#   actions/setup-node v4 -> v4.4.0  49933ea5288caeca8642d1e84afbd3f7d6820020
+#
+# The trailing `# v4.4.0` on each line is the human-readable version the SHA
+# was resolved from -- keep it accurate when bumping. To upgrade: resolve the
+# new tag to its SHA and replace both halves together; never "fix" a pin by
+# reverting it to a tag. Keeping pins fresh via Dependabot/Renovate is out of
+# scope here (ALI-144 notes); mechanical enforcement of this invariant is
+# ALI-145's check-ci-invariant.js, which is why no check script lands here.
 jobs:
   markdown-links:
     name: Markdown cross-reference check
@@ -58,13 +88,13 @@ jobs:
     # fail-closed -- it cannot silently swallow a real gate verdict.
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # F6: do not leave the job's GITHUB_TOKEN in .git/config for every
           # later step (and every PR-authored script they run) to reuse.
           persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
 
@@ -85,11 +115,11 @@ jobs:
     # F5: bounded. Sub-30s job; 5 minutes is >=10x headroom.
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false  # F6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
 
@@ -109,11 +139,11 @@ jobs:
     # shipped workflow rather than against the three jobs F5 happened to see.
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false  # F6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
 
@@ -135,11 +165,11 @@ jobs:
     # into noise people learn to re-run past.
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false  # F6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
 
