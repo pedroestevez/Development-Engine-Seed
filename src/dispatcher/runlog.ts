@@ -9,8 +9,10 @@
  *     runtime-only addition: `not-reached`, for a candidate `plan()`
  *     admitted but the run stopped before dispatching (settled per the
  *     readiness pass's open question — see the PR body).
- *   - `StopReason` — why the whole run ended. Exactly six values, always
- *     one of them, never free text (AC7).
+ *   - `StopReason` — why the whole run ended. Exactly seven values, always
+ *     one of them, never free text (AC7, ALI-103; `engine-drift` added by
+ *     ALI-104 — refuse, don't adapt, when a resumed run's required pin no
+ *     longer matches the resolved HEAD).
  *
  * This module also owns secret redaction (AC10): the compensating control
  * for the security pass this issue does not get, because it carries no
@@ -83,7 +85,8 @@ export type StopReason =
   | "backstop-wallclock"
   | "backstop-tokens"
   | "gate-hit"
-  | "no-approved-cycle";
+  | "no-approved-cycle"
+  | "engine-drift";
 
 export const STOP_REASONS: readonly StopReason[] = [
   "cycle-empty",
@@ -92,6 +95,7 @@ export const STOP_REASONS: readonly StopReason[] = [
   "backstop-tokens",
   "gate-hit",
   "no-approved-cycle",
+  "engine-drift",
 ] as const;
 
 export function isStopReason(value: string): value is StopReason {

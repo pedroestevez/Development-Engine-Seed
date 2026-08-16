@@ -13,10 +13,21 @@
  *     fire is a calibration defect and is counted as one (AC9).
  *
  * Ports and adapters: every side effect is behind an injected interface
- * (`LinearPort`, `GitHubPort`, `WorktreePort`, `AgentPort`, `Clock`). This
- * file's own logic — the run loop itself — is a deterministic function of
- * those ports' behavior, which is what makes criteria 1–7 testable without
- * network, real git, or real subprocesses (see `__tests__/run.test.ts`).
+ * (`LinearPort`, `GitHubPort`, `WorktreePort`, `EnginePinPort`, `AgentPort`,
+ * `Clock`). This file's own logic — the run loop itself — is a deterministic
+ * function of those ports' behavior, which is what makes criteria 1–7
+ * testable without network, real git, or real subprocesses (see
+ * `__tests__/run.test.ts`).
+ *
+ * The pin (ALI-104): `runDispatcher()` resolves its own engine commit via
+ * `EnginePinPort.resolveEngineSha()` — never a caller-supplied config field
+ * — and every agent this run spawns reads `.claude/**` from a read-only
+ * detached checkout at that pin (`EnginePinPort.createPinnedTree()`), kept
+ * separate from the mutable per-cluster work worktrees `WorktreePort`
+ * creates. A run resuming interrupted work sets `RuntimeConfig.requiredPin`;
+ * if the freshly-resolved HEAD no longer matches it, the run refuses
+ * (`stop_reason: "engine-drift"`) rather than execute against a different
+ * engine version than the one that parked it.
  *
  * One exception, by design: `runDispatcher()` itself never touches the
  * filesystem, so the run-loop logic above keeps testing purely against
@@ -35,7 +46,7 @@ import {
   type CycleRef,
   type LinearPort,
 } from "./linear.js";
-import type { DraftPrResult, GitHubPort, WorktreeHandle, WorktreePort } from "./worktree.js";
+import type { DraftPrResult, EnginePinPort, GitHubPort, WorktreeHandle, WorktreePort } from "./worktree.js";
 import {
   deferralReasonToVerdict,
   redact,
@@ -62,6 +73,13 @@ export interface DispatchContext {
   issue: Issue;
   worktreePath: string;
   branch: string;
+  /**
+   * Absolute path to this run's read-only pinned engine tree — the sole
+   * source of `.claude/**` for the agent this context is handed to (ALI-104
+   * AC2). Never the same tree as `worktreePath`: that one is mutable and
+   * per-cluster, this one is detached and shared by the whole run.
+   */
+  enginePath: string;
 }
 
 export interface AgentDispatchResult {
@@ -138,16 +156,34 @@ export interface RuntimeConfig {
   /** ALI-102's admission/partitioning config — budget, risk weight, max concurrency. */
   dispatcher: DispatcherConfig;
   backstop: BackstopConfig;
-  /** The commit this run executed against — pinned into every run log (ALI-104 pins it physically). */
-  engineSha: string;
-  /** Git ref new cluster worktrees branch from, e.g. `"origin/main"`. */
+  /**
+   * The ref every PR this run opens targets, e.g. `"origin/main"` — a
+   * moving branch. Deliberately **not** the ref work worktrees branch from
+   * (ALI-104 AC3): that is the resolved pin, always. A PR opened against a
+   * commit rather than a branch could never be merged, so the two must
+   * never be collapsed even though both start as "some git ref".
+   */
   baseRef: string;
+  /**
+   * Set only when resuming work a previous run parked. That prior run's
+   * `runLog.engineSha` — the version `.claude/**` had when it parked. If
+   * the freshly-resolved HEAD (`EnginePinPort.resolveEngineSha()`) no
+   * longer matches, the run refuses via `stop_reason: "engine-drift"`
+   * rather than resume on a version of the engine the parked artifact was
+   * never built against (ALI-104 AC4). Unset on a fresh run — no drift
+   * check applies. Deliberately **not** named `engineSha`: the run's own
+   * pin is never a config input (AC1) — this field only ever *constrains*
+   * it, never supplies it.
+   */
+  requiredPin?: string;
 }
 
 export interface RunDeps {
   linear: LinearPort;
   github: GitHubPort;
   worktree: WorktreePort;
+  /** ALI-104: resolves the run's own pin and creates the read-only tree every agent reads `.claude/**` from. */
+  enginePin: EnginePinPort;
   agent: AgentPort;
   clock: Clock;
   credentials: RuntimeCredentials;
@@ -261,6 +297,7 @@ async function finalizeParked(
   worktreeHandle: WorktreeHandle,
   deps: RunDeps,
   config: RuntimeConfig,
+  engineSha: string,
   cycle: CycleRef,
   seats: SeatOutcome[],
   resumePoint: string,
@@ -272,7 +309,7 @@ async function finalizeParked(
     branch: worktreeHandle.branch,
     base: config.baseRef,
     title: `[parked] ${issue.id} ${issue.title}`,
-    body: `${buildResumeNote(seats, resumePoint)}\n\nEngine SHA: ${config.engineSha}.`,
+    body: `${buildResumeNote(seats, resumePoint)}\n\nEngine SHA: ${engineSha}.`,
   });
   // Preserve the issue's existing (approved) cycle -- the ALI-103 addendum:
   // moving an issue out of Backlog was observed to silently auto-assign the
@@ -281,7 +318,7 @@ async function finalizeParked(
   await deps.linear.setIssueStatus(issue.id, "Parked", cycle.id);
   await deps.linear.addComment(
     issue.id,
-    `${buildResumeNote(seats, resumePoint)}\n\nEngine SHA: \`${config.engineSha}\`.\nPR: ${pr.url}`,
+    `${buildResumeNote(seats, resumePoint)}\n\nEngine SHA: \`${engineSha}\`.\nPR: ${pr.url}`,
   );
   return pr;
 }
@@ -289,7 +326,7 @@ async function finalizeParked(
 async function finalizeNeedsPedro(
   issue: Issue,
   deps: RunDeps,
-  config: RuntimeConfig,
+  engineSha: string,
   question: string,
 ): Promise<void> {
   // Clear the cycle -- excluded from every run until Pedro answers (the addendum's other half).
@@ -297,7 +334,7 @@ async function finalizeNeedsPedro(
   await deps.linear.addComment(
     issue.id,
     `Ambiguity found — flagged rather than guessed, per conduct.\n\n${question}\n\n` +
-      `Engine SHA: \`${config.engineSha}\`.`,
+      `Engine SHA: \`${engineSha}\`.`,
   );
 }
 
@@ -306,6 +343,7 @@ async function finalizeOpenedPr(
   worktreeHandle: WorktreeHandle,
   deps: RunDeps,
   config: RuntimeConfig,
+  engineSha: string,
   cycle: CycleRef,
   seats: SeatOutcome[],
 ): Promise<DraftPrResult> {
@@ -314,13 +352,13 @@ async function finalizeOpenedPr(
     branch: worktreeHandle.branch,
     base: config.baseRef,
     title: `${issue.id}: ${issue.title}`,
-    body: `Implements ${issue.id}. Engine SHA: ${config.engineSha}.`,
+    body: `Implements ${issue.id}. Engine SHA: ${engineSha}.`,
   });
   await deps.linear.setIssueStatus(issue.id, "In Review", cycle.id);
   const seatSummary = seats.map((s) => `${s.seat}: ${s.status}${s.detail ? ` — ${s.detail}` : ""}`).join("\n");
   await deps.linear.addComment(
     issue.id,
-    `Seats:\n${seatSummary}\n\nEngine SHA: \`${config.engineSha}\`.\nPR: ${pr.url}`,
+    `Seats:\n${seatSummary}\n\nEngine SHA: \`${engineSha}\`.\nPR: ${pr.url}`,
   );
   return pr;
 }
@@ -328,12 +366,19 @@ async function finalizeOpenedPr(
 async function dispatchOneIssue(
   issue: Issue,
   worktreeHandle: WorktreeHandle,
+  enginePath: string,
+  engineSha: string,
   deps: RunDeps,
   config: RuntimeConfig,
   cycle: CycleRef,
   state: DispatchState,
 ): Promise<IssueDispatchResult> {
-  const ctx: DispatchContext = { issue, worktreePath: worktreeHandle.path, branch: worktreeHandle.branch };
+  const ctx: DispatchContext = {
+    issue,
+    worktreePath: worktreeHandle.path,
+    branch: worktreeHandle.branch,
+    enginePath,
+  };
   const seats: SeatOutcome[] = [];
   let bounces = 0;
   let tokensUsed = 0;
@@ -349,13 +394,13 @@ async function dispatchOneIssue(
   seats.push({ seat: "builder", status: "ran", detail: builderResult.summary });
 
   if (builderResult.ambiguous) {
-    await finalizeNeedsPedro(issue, deps, config, builderResult.ambiguous.question);
+    await finalizeNeedsPedro(issue, deps, engineSha, builderResult.ambiguous.question);
     return { hardKilled: false, outcome: "needs-pedro", seats, bounces, tokensUsed };
   }
 
   // Checkpoint 1/3 (AC5): after builder, before blind QA.
   if (isBeyondHard(deps.clock, config, state)) {
-    await finalizeParked(issue, worktreeHandle, deps, config, cycle, seats, "after builder");
+    await finalizeParked(issue, worktreeHandle, deps, config, engineSha, cycle, seats, "after builder");
     return { hardKilled: true, outcome: "parked", seats, bounces, tokensUsed };
   }
 
@@ -370,7 +415,7 @@ async function dispatchOneIssue(
 
   // Checkpoint 2/3 (AC5): after reviewer, before security (or its skip).
   if (isBeyondHard(deps.clock, config, state)) {
-    await finalizeParked(issue, worktreeHandle, deps, config, cycle, seats, "after reviewer");
+    await finalizeParked(issue, worktreeHandle, deps, config, engineSha, cycle, seats, "after reviewer");
     return { hardKilled: true, outcome: "parked", seats, bounces, tokensUsed };
   }
 
@@ -385,11 +430,11 @@ async function dispatchOneIssue(
 
   // Checkpoint 3/3 (AC5): after security (or its skip), before finalize.
   if (isBeyondHard(deps.clock, config, state)) {
-    await finalizeParked(issue, worktreeHandle, deps, config, cycle, seats, "after security");
+    await finalizeParked(issue, worktreeHandle, deps, config, engineSha, cycle, seats, "after security");
     return { hardKilled: true, outcome: "parked", seats, bounces, tokensUsed };
   }
 
-  await finalizeOpenedPr(issue, worktreeHandle, deps, config, cycle, seats);
+  await finalizeOpenedPr(issue, worktreeHandle, deps, config, engineSha, cycle, seats);
   return { hardKilled: false, outcome: "opened-pr", seats, bounces, tokensUsed };
 }
 
@@ -435,6 +480,8 @@ function deriveNormalStopReason(runPlan: RunPlan): "cycle-empty" | "budget-exhau
 
 function buildRunLog(params: {
   config: RuntimeConfig;
+  /** The pin resolved by AC1, at the top of this run -- the run log's only source for this field. */
+  engineSha: string;
   cycleId: string | null;
   approvalRef: string | null;
   runPlan: RunPlan;
@@ -445,8 +492,18 @@ function buildRunLog(params: {
   generatedAt: string;
   fatalError?: string;
 }): RunLog {
-  const { config, cycleId, approvalRef, runPlan, ledger, stopReason, backstopFireCount, credentials, generatedAt } =
-    params;
+  const {
+    config,
+    engineSha,
+    cycleId,
+    approvalRef,
+    runPlan,
+    ledger,
+    stopReason,
+    backstopFireCount,
+    credentials,
+    generatedAt,
+  } = params;
 
   const candidateOrder = [...runPlan.admitted, ...runPlan.deferred.map((d) => d.issue)];
   const candidates = candidateOrder.map((issue) => mustGetLedger(ledger, issue.id));
@@ -460,7 +517,7 @@ function buildRunLog(params: {
   }));
 
   const log: RunLog = {
-    engineSha: config.engineSha,
+    engineSha,
     cycleId,
     approvalRef,
     generatedAt,
@@ -506,6 +563,37 @@ export async function runDispatcher(config: RuntimeConfig, deps: RunDeps): Promi
     config: config.dispatcher,
   };
 
+  // -1. Resolve the engine's own pin -- physically, via an injected port,
+  // never a caller-supplied string (ALI-104 AC1). Every run log this
+  // function returns below, however it ends, carries this exact value.
+  // Resolved before touching Linear: drift is a purely local, physical
+  // question, and refusing early means a stale run never reads or writes
+  // Linear state at all (AC4).
+  const engineSha = await deps.enginePin.resolveEngineSha();
+
+  // -1.5. engine-drift refusal (ALI-104 AC4) -- the seventh stop reason,
+  // fail-closed in the same shape as no-approved-cycle/gate-hit below: a
+  // run resuming interrupted work carries the pin its parked artifact was
+  // built against (`requiredPin`); if the engine has since moved, refuse
+  // rather than execute part of the run against one version of
+  // `.claude/**` and the rest against another. A fresh run sets no
+  // `requiredPin`, so this never applies to it.
+  if (config.requiredPin !== undefined && config.requiredPin !== engineSha) {
+    const runLog = buildRunLog({
+      config,
+      engineSha,
+      cycleId: null,
+      approvalRef: null,
+      runPlan: emptyPlan,
+      ledger: new Map(),
+      stopReason: "engine-drift",
+      backstopFireCount: 0,
+      credentials,
+      generatedAt: new Date(deps.clock.now()).toISOString(),
+    });
+    return finish(runLog);
+  }
+
   // 0. Status-name drift check -- on startup, before anything else (AC8).
   // Never let "no matching status" read as "no work": a board/docs mismatch
   // fails loud, not silently as an empty run.
@@ -514,6 +602,7 @@ export async function runDispatcher(config: RuntimeConfig, deps: RunDeps): Promi
   if (!drift.ok) {
     const runLog = buildRunLog({
       config,
+      engineSha,
       cycleId: null,
       approvalRef: null,
       runPlan: emptyPlan,
@@ -532,6 +621,7 @@ export async function runDispatcher(config: RuntimeConfig, deps: RunDeps): Promi
   if (!cycle) {
     const runLog = buildRunLog({
       config,
+      engineSha,
       cycleId: null,
       approvalRef: null,
       runPlan: emptyPlan,
@@ -550,6 +640,12 @@ export async function runDispatcher(config: RuntimeConfig, deps: RunDeps): Promi
   // 3. Plan (ALI-102's pure core): admit -> partition -> laneCount -> modelTier.
   const runPlan = plan(readyIssues, config.dispatcher);
   const ledger = buildCandidateLedger(runPlan);
+
+  // 4. Create this run's one read-only pinned engine tree (ALI-104 AC2) --
+  // a single call site, before any concurrent lane starts, so "exactly one
+  // detached checkout" holds regardless of lane count. Every DispatchContext
+  // below carries its path; nothing in this runtime ever writes to it.
+  const enginePath = await deps.enginePin.createPinnedTree(engineSha);
 
   const state: DispatchState = {
     runStartMs,
@@ -577,13 +673,15 @@ export async function runDispatcher(config: RuntimeConfig, deps: RunDeps): Promi
       }
 
       if (!worktreeHandle) {
-        worktreeHandle = await deps.worktree.createWorktree(branchNameFor(cluster), config.baseRef);
+        // Work worktrees branch FROM the resolved pin, not `config.baseRef`
+        // (ALI-104 AC3) -- `baseRef` is reserved for where PRs land, below.
+        worktreeHandle = await deps.worktree.createWorktree(branchNameFor(cluster), engineSha);
       }
 
       await deps.linear.setIssueStatus(issue.id, "In Progress", cycle.id);
 
       const dispatchStartMs = deps.clock.now();
-      const result = await dispatchOneIssue(issue, worktreeHandle, deps, config, cycle, state);
+      const result = await dispatchOneIssue(issue, worktreeHandle, enginePath, engineSha, deps, config, cycle, state);
       const entry = mustGetLedger(ledger, issue.id);
       entry.seats = result.seats;
       entry.bounces = result.bounces;
@@ -629,6 +727,7 @@ export async function runDispatcher(config: RuntimeConfig, deps: RunDeps): Promi
 
   const runLog = buildRunLog({
     config,
+    engineSha,
     cycleId: cycle.id,
     approvalRef: cycle.approvalRef,
     runPlan,
