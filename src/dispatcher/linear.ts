@@ -194,15 +194,70 @@ const ERROR_BODY_SNIPPET_CHARS = 500;
 // ---------------------------------------------------------------------------
 
 /**
+ * Credentials this process has handed to a `createLinearApiPort()` call, held
+ * only so error text can be redacted against them **by value**. Never read
+ * back out, never logged, never exported — there is no getter.
+ *
+ * Why a registry rather than threading the key through every call site
+ * (security finding S2): the leaking paths are `parsePredictedFiles()` and
+ * `mapIssueNode()`, which interpolate *server-controlled* text (an issue body,
+ * an `identifier`) and are exported, pure, and callable without an adapter.
+ * Passing a redactor into each would leave the chokepoint optional, and the
+ * first path that forgot it would leak — exactly what the first cut of this
+ * adapter did, where value-redaction lived in the transport alone.
+ */
+const REDACTABLE_CREDENTIALS = new Set<string>();
+
+/** Called by `validateConfig` only. */
+function rememberCredential(apiKey: string): void {
+  REDACTABLE_CREDENTIALS.add(apiKey);
+}
+
+/**
+ * Both AC6 controls, in one place:
+ *   1. value-redaction against every credential this process holds — catches a
+ *      token with no recognised prefix (an OAuth token, should ALI-156 need
+ *      one), which prefix matching cannot see;
+ *   2. `scrubSecrets()` (runlog.ts) — catches credentials belonging to *other*
+ *      systems that a Linear response body might echo.
+ * Neither subsumes the other, so both always run, in that order.
+ */
+function sanitizeMessage(text: string): string {
+  let out = text;
+  for (const credential of REDACTABLE_CREDENTIALS) {
+    out = out.split(credential).join("[REDACTED]");
+  }
+  return scrubSecrets(out);
+}
+
+/**
+ * Security finding S3: `.message` was redacted but `cause` was forwarded raw,
+ * and `run.ts` has no try/catch — so an unattended run's default handler would
+ * print the unredacted cause chain. The cause is replaced by a sanitized
+ * stand-in that keeps the diagnostic `name` and message, and drops the
+ * original's `stack` (whose first line embeds the raw message) and any nested
+ * cause of its own.
+ */
+function sanitizeCause(cause: unknown): unknown {
+  if (cause === undefined) return undefined;
+  if (cause instanceof Error) {
+    const sanitized = new Error(sanitizeMessage(cause.message));
+    sanitized.name = cause.name;
+    sanitized.stack = `${cause.name}: ${sanitizeMessage(cause.message)}\n    (stack omitted — see the LinearApiError above)`;
+    return sanitized;
+  }
+  return sanitizeMessage(String(cause));
+}
+
+/**
  * Every error this adapter throws. The constructor is the single choke point
- * for AC6: `scrubSecrets()` (runlog.ts) runs over the message here, so there
- * is no path that builds a message and forgets — including messages that
- * quote a Linear response body, which is exactly where an echoed credential
- * would arrive.
+ * for AC6 — message *and* cause — so there is no path that builds an error and
+ * forgets, whether it is raised by the transport, the mapping, or the
+ * predicted-files parser.
  */
 export class LinearApiError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
-    super(scrubSecrets(message), options);
+    super(sanitizeMessage(message), options?.cause === undefined ? undefined : { cause: sanitizeCause(options.cause) });
     this.name = "LinearApiError";
   }
 }
@@ -256,6 +311,26 @@ export const DEFAULT_RETRY_POLICY: RetryPolicy = {
 /** Refuses a policy that could not terminate — a config-level guard on the same property AC5 tests. */
 const MAX_ALLOWED_ATTEMPTS = 10;
 
+/** Structural ceiling on any single backoff sleep, `Retry-After` included (security finding S7). */
+const MAX_ALLOWED_DELAY_MS = 60_000;
+
+/** Structural ceiling on the per-request timeout (security finding S7). */
+const MAX_ALLOWED_TIMEOUT_MS = 120_000;
+
+/**
+ * Shortest credential this adapter will accept. Not a strength check — it
+ * guarantees value-redaction can never be skipped for an accepted key
+ * (security finding S7).
+ */
+const MIN_API_KEY_CHARS = 8;
+
+/**
+ * Lowest estimate the engine can price. The routing table's lowest row is
+ * 1 point (CLAUDE.md "Routing"), so anything below it has no tier and prices
+ * as free — or, if negative, as budget headroom (security finding S4).
+ */
+const MIN_ESTIMATE_POINTS = 1;
+
 /** Per-request timeout. Node's `fetch` has none by default; a stalled socket would hang the run forever. */
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -305,6 +380,16 @@ function validateConfig(config: LinearApiConfig): AdapterRuntime {
         "constructed without a credential would fail on every call at run time instead of here.",
     );
   }
+  if (config.apiKey.length < MIN_API_KEY_CHARS) {
+    // Security finding S7: a very short "credential" is not a Linear key, and
+    // value-redaction of a 3-character string would corrupt unrelated error
+    // text. Rejecting it here keeps redaction total for every key that is
+    // actually accepted, instead of silently exempting the short ones.
+    throw new LinearApiError(
+      `Linear API key is implausibly short (< ${MIN_API_KEY_CHARS} characters). Real Linear keys are far ` +
+        `longer; a value this short is a misconfiguration, and it would weaken credential redaction.`,
+    );
+  }
   if (typeof config.teamId !== "string" || config.teamId.trim() === "") {
     throw new LinearApiError(`Linear team id is empty. Set ${LINEAR_TEAM_ID_ENV} (provisioned by ALI-157).`);
   }
@@ -319,14 +404,29 @@ function validateConfig(config: LinearApiConfig): AdapterRuntime {
   if (!Number.isFinite(retry.baseDelayMs) || retry.baseDelayMs < 0) {
     throw new LinearApiError(`Invalid retry policy: baseDelayMs must be a finite, non-negative number.`);
   }
-  if (!Number.isFinite(retry.maxDelayMs) || retry.maxDelayMs < 0) {
-    throw new LinearApiError(`Invalid retry policy: maxDelayMs must be a finite, non-negative number.`);
+  if (!Number.isFinite(retry.maxDelayMs) || retry.maxDelayMs < 0 || retry.maxDelayMs > MAX_ALLOWED_DELAY_MS) {
+    // Security finding S7: `maxDelayMs` is what caps a server-supplied
+    // `Retry-After`, so the "bounded worst-case wall clock" property was
+    // bounded by *config*, not by the adapter. Now the ceiling is structural:
+    // worst case is `(maxAttempts-1) × MAX_ALLOWED_DELAY_MS`, whatever a caller
+    // (or a hostile `Retry-After`) asks for.
+    throw new LinearApiError(
+      `Invalid retry policy: maxDelayMs must be a finite number in 0..${MAX_ALLOWED_DELAY_MS} ms, got ` +
+        `${String(retry.maxDelayMs)}. It is the ceiling a server-supplied Retry-After is clamped to, so it ` +
+        "bounds how long an unattended run can be parked.",
+    );
   }
 
   const requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
-  if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) {
-    throw new LinearApiError(`Invalid requestTimeoutMs: must be a finite, positive number.`);
+  if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0 || requestTimeoutMs > MAX_ALLOWED_TIMEOUT_MS) {
+    throw new LinearApiError(
+      `Invalid requestTimeoutMs: must be a finite number in 1..${MAX_ALLOWED_TIMEOUT_MS} ms.`,
+    );
   }
+
+  // Registered only after every validation has passed, so a rejected config
+  // never adds a value to the redaction set.
+  rememberCredential(config.apiKey);
 
   return {
     endpoint: config.endpoint ?? LINEAR_API_URL,
@@ -391,22 +491,6 @@ function describeCause(cause: unknown): string {
 }
 
 /**
- * AC6, second control. `scrubSecrets()` matches on the four known credential
- * PREFIXES (`runlog.ts`), which covers a Linear personal API key
- * (`lin_api_…`) but not, say, an OAuth access token that ALI-156 might make
- * necessary. This removes the credential this adapter actually holds, by
- * value, whatever shape it has. Both controls run on every message: prefix
- * matching catches credentials belonging to *other* systems that a response
- * body might echo, value matching catches ours.
- *
- * The primary control remains structural — this module never interpolates
- * `apiKey` into a message; it only ever goes into the `Authorization` header.
- */
-function scrubCredential(text: string, apiKey: string): string {
-  return apiKey.length >= 8 ? text.split(apiKey).join("[REDACTED]") : text;
-}
-
-/**
  * `Retry-After` is honoured but CAPPED at `maxDelayMs`: a server (or a
  * man-in-the-middle) asking us to sleep for an hour must not be able to park
  * an unattended run for an hour. Exponential backoff is the floor.
@@ -435,9 +519,6 @@ async function executeGraphQL(
   variables: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const { retry } = runtime;
-  /** Every throw below goes through here: value-redaction, then `LinearApiError`'s prefix-scrub. */
-  const failure = (message: string, options?: { cause?: unknown }): LinearApiError =>
-    new LinearApiError(scrubCredential(message, runtime.apiKey), options);
 
   for (let attempt = 1; attempt <= retry.maxAttempts; attempt++) {
     let response: HttpResponseLike;
@@ -454,7 +535,7 @@ async function executeGraphQL(
         signal: AbortSignal.timeout(runtime.requestTimeoutMs),
       });
     } catch (cause) {
-      throw failure(
+      throw new LinearApiError(
         `Linear API request failed (${operationName}, attempt ${attempt}/${retry.maxAttempts}): ` +
           `${describeCause(cause)}`,
         { cause },
@@ -465,7 +546,7 @@ async function executeGraphQL(
     try {
       bodyText = await response.text();
     } catch (cause) {
-      throw failure(
+      throw new LinearApiError(
         `Linear API response body could not be read (${operationName}, HTTP ${response.status}): ` +
           `${describeCause(cause)}`,
         { cause },
@@ -482,7 +563,7 @@ async function executeGraphQL(
 
     if (isRateLimitedEnvelope(response.status, envelope)) {
       if (attempt >= retry.maxAttempts) {
-        throw failure(
+        throw new LinearApiError(
           `Linear API rate limit not cleared: gave up on ${operationName} after ${retry.maxAttempts} ` +
             `attempt(s) (HTTP ${response.status}). Retries are bounded on purpose — an unattended run ` +
             `must never spin against a rate limit. Last response: ${snippet(bodyText)}`,
@@ -493,24 +574,24 @@ async function executeGraphQL(
     }
 
     if (!response.ok) {
-      throw failure(
+      throw new LinearApiError(
         `Linear API returned HTTP ${response.status} for ${operationName}: ${snippet(bodyText)}`,
       );
     }
     if (envelope === null) {
-      throw failure(
+      throw new LinearApiError(
         `Linear API returned a non-JSON body for ${operationName} (HTTP ${response.status}): ${snippet(bodyText)}`,
       );
     }
     if (Array.isArray(envelope.errors) && envelope.errors.length > 0) {
-      throw failure(
+      throw new LinearApiError(
         `Linear API returned GraphQL errors for ${operationName}: ${renderGraphQLErrors(envelope)}`,
       );
     }
 
     const data = asRecord(envelope.data);
     if (data === null) {
-      throw failure(
+      throw new LinearApiError(
         `Linear API returned no \`data\` for ${operationName} (HTTP ${response.status}): ${snippet(bodyText)}`,
       );
     }
@@ -518,7 +599,7 @@ async function executeGraphQL(
   }
 
   /* c8 ignore next 4 -- unreachable: the loop either returns, throws, or exhausts into the rate-limit branch. */
-  throw failure(
+  throw new LinearApiError(
     `Linear API retry loop exited without a result for ${operationName} — this is a bug in the adapter.`,
   );
 }
@@ -623,6 +704,53 @@ function connectionNodes(value: unknown): unknown[] | null {
 }
 
 /**
+ * Security finding S1 (blocking) — a nested connection that TRUNCATED at the
+ * page cap fails loud.
+ *
+ * `labels` and `inverseRelations` are fetched one page deep. Without
+ * `pageInfo`, a partial set is indistinguishable from a complete one **by
+ * construction** — and both feed safety controls:
+ *
+ *   - a danger label past the cap ⇒ `riskTier: "none"` ⇒ the model tier drops
+ *     off its floor and the **mandatory security pass is skipped**, silently;
+ *   - a blocker past the cap ⇒ invisible to `plan.ts`'s `admit()` ⇒ an issue
+ *     is admitted ahead of the dependency that blocks it.
+ *
+ * The adapter already refuses to keep paging at the TOP level (`MAX_PAGES`,
+ * = 1000 issues) on the reasoning that "a truncated candidate list would
+ * silently change what the run builds". Fifty labels on one issue is the far
+ * likelier event, so the same doctrine applies here. Nested pagination is
+ * deliberately NOT implemented: the correct response to an issue with 50+
+ * labels is a loud error a human reads, not a quiet extra round trip.
+ *
+ * A missing/malformed `pageInfo` is treated as truncation too — the query asks
+ * for it and `IssueLabelConnection.pageInfo` is non-null in Linear's schema,
+ * so its absence means the response is not the shape this adapter validated
+ * against, and "cannot tell" must fail the same way as "yes".
+ */
+function assertNestedConnectionComplete(
+  connection: unknown,
+  field: string,
+  identifier: string,
+  consequence: string,
+): void {
+  const pageInfo = asRecord(asRecord(connection)?.pageInfo);
+  if (pageInfo === null || typeof pageInfo.hasNextPage !== "boolean") {
+    throw new LinearApiError(
+      `${identifier}: Linear returned no usable \`pageInfo\` on the \`${field}\` connection, so truncation ` +
+        `would be undetectable. ${consequence}`,
+    );
+  }
+  if (pageInfo.hasNextPage) {
+    throw new LinearApiError(
+      `${identifier}: the \`${field}\` connection is TRUNCATED — Linear reports more than the ${PAGE_SIZE} ` +
+        `rows fetched (hasNextPage: true). ${consequence} Refusing to map a partial set: this is the same ` +
+        `doctrine as the top-level ${MAX_PAGES}-page cap, one level down.`,
+    );
+  }
+}
+
+/**
  * AC2, client side. The GraphQL filter already asks Linear for exactly
  * `Ready` ∩ `cycleId` ∩ this team; this re-checks the answer. Defense in
  * depth on the gate that decides what executes unattended — the same "also
@@ -637,8 +765,12 @@ function matchesReadGate(node: Record<string, unknown>, cycleId: string, teamId:
   if (stateName !== READY_STATE_NAME) return false;
   const nodeCycleId = asRecord(node.cycle)?.id;
   if (nodeCycleId !== cycleId) return false;
+  // Security finding S5: this used to admit a row whose `team` was absent,
+  // null, or id-less — the one leg of the gate that treated "cannot tell" as
+  // consent, while `state` and `cycle` excluded on exactly that input. All
+  // three now fail closed.
   const nodeTeamId = asRecord(node.team)?.id;
-  return nodeTeamId === undefined || nodeTeamId === teamId;
+  return nodeTeamId === teamId;
 }
 
 function readLabelNames(node: Record<string, unknown>, identifier: string): string[] {
@@ -653,6 +785,13 @@ function readLabelNames(node: Record<string, unknown>, identifier: string): stri
         "mandatory security pass (CLAUDE.md \"Routing\") — an empty label list is never assumed.",
     );
   }
+  assertNestedConnectionComplete(
+    node.labels,
+    "labels",
+    identifier,
+    "Labels carry the risk half of max(pointsTier, riskTier): a danger label past the page cap would map " +
+      "to riskTier \"none\", drop the issue off its model-tier floor, and skip the mandatory security pass.",
+  );
   return nodes.map((label) => {
     const name = asRecord(label)?.name;
     if (typeof name !== "string") {
@@ -679,6 +818,13 @@ function readBlockedBy(node: Record<string, unknown>, identifier: string): strin
         "is derived from it, so an empty list is never assumed.",
     );
   }
+  assertNestedConnectionComplete(
+    node.inverseRelations,
+    "inverseRelations",
+    identifier,
+    "blockedBy is derived from it: a blocker past the page cap would be invisible to plan.ts's admit(), " +
+      "which would then admit this issue ahead of the work that blocks it.",
+  );
   const blockers: string[] = [];
   for (const relation of nodes) {
     const record = asRecord(relation);
@@ -718,15 +864,26 @@ export function mapIssueNode(rawNode: unknown): LinearIssue {
   }
 
   const estimate = node.estimate;
-  if (typeof estimate !== "number" || !Number.isFinite(estimate)) {
+  if (typeof estimate !== "number" || !Number.isFinite(estimate) || estimate < MIN_ESTIMATE_POINTS) {
     // Fail-closed by analogy to AC4: `Issue.estimate` is nullable in Linear's
-    // schema, and a `Ready` issue with no estimate is unpriced work. Defaulting
-    // it to 0 would make it free against the budget gate and admit it on every
-    // run forever — a silent gate failure, not a missing nicety.
+    // schema, and a `Ready` issue with no estimate is unpriced work.
+    //
+    // Security finding S4 closed the bypass in the first cut: `0` is a LEGAL
+    // Linear estimate, so it arrives from the real API, and it produced exactly
+    // the outcome this guard exists to prevent — 40 zero-point issues admitted
+    // against a budget of 5, none deferred; a negative estimate was worse
+    // still, ADDING headroom via `runningCost += cost`. The floor is principled
+    // rather than arbitrary: the routing table's lowest row IS 1 point
+    // (CLAUDE.md "Routing": 1 → cheap tier, 2–3 → mid, 5/architectural → top),
+    // so an issue below 1 has no tier row and is outside the engine's
+    // estimation domain — the same statement as "unpriced".
     throw new LinearApiError(
-      `${identifier}: is in state ${READY_STATE_NAME} with no numeric \`estimate\`. Points are the budget ` +
-        "gate's only input (docs/ENGINE.md §4) — unpriced work is never admitted at a default of 0. " +
-        "Estimate the issue in Linear, or move it out of Ready.",
+      `${identifier}: is in state ${READY_STATE_NAME} with estimate ${JSON.stringify(estimate ?? null)}, ` +
+        `which is not a finite number of at least ${MIN_ESTIMATE_POINTS} point. Points are the budget ` +
+        "gate's only input (docs/ENGINE.md §4) and the routing table's lowest row is 1 point — a 0, " +
+        "negative, or missing estimate prices work as free (or as negative cost, which ADDS budget " +
+        "headroom) and would admit it on every run forever. Estimate the issue in Linear, or move it " +
+        "out of Ready.",
     );
   }
 
@@ -785,8 +942,11 @@ const READY_ISSUES_QUERY = `
         state { name }
         cycle { id }
         team { id }
-        labels(first: ${PAGE_SIZE}) { nodes { name } }
-        inverseRelations(first: ${PAGE_SIZE}) { nodes { type issue { identifier } } }
+        labels(first: ${PAGE_SIZE}) { nodes { name } pageInfo { hasNextPage } }
+        inverseRelations(first: ${PAGE_SIZE}) {
+          nodes { type issue { identifier } }
+          pageInfo { hasNextPage }
+        }
       }
       pageInfo { hasNextPage endCursor }
     }
@@ -899,6 +1059,16 @@ export function createLinearApiPort(config: LinearApiConfig): LinearPort {
       };
 
       const issues: LinearIssue[] = [];
+      // Security finding S6: cursor pagination over mutable data genuinely can
+      // serve the same row on two pages, and this adapter used to return it
+      // twice. That was *incidentally* harmless — `plan.ts`'s
+      // `priorityThenDependencyOrder()` is id-keyed via a `Set`, so `admit()`
+      // collapsed the duplicate (probed: no double-billing, no crowd-out) —
+      // but `partition()` does NOT dedup, so the protection rested entirely on
+      // `admit()` running first, an undocumented coupling in another module.
+      // De-duplicating at the source makes the port's contract self-contained:
+      // "each Ready issue in the cycle, once". First occurrence wins.
+      const seenIdentifiers = new Set<string>();
       let after: string | null = null;
 
       for (let page = 1; page <= MAX_PAGES; page++) {
@@ -936,7 +1106,10 @@ export function createLinearApiPort(config: LinearApiConfig): LinearPort {
           // Gate first, map second: a row the gate excludes must not be able
           // to fail the run by having an unparseable body.
           if (!matchesReadGate(node, cycleId, runtime.teamId)) continue;
-          issues.push(mapIssueNode(node));
+          const issue = mapIssueNode(node);
+          if (seenIdentifiers.has(issue.id)) continue;
+          seenIdentifiers.add(issue.id);
+          issues.push(issue);
         }
 
         const { hasNextPage, endCursor } = readPageInfo(connection);
