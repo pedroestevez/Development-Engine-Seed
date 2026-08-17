@@ -157,9 +157,12 @@ export interface BlindQaDispatchResult {
  * definition only from `DispatchContext.enginePath`, and bounds every
  * dispatch with a wall-clock timeout — the last of which is what keeps a
  * hung seat from holding a run past the hard backstop this file's
- * `isBeyondHard()` checks. `dispatchBlindQa` stays a loud stub there until
- * ALI-162 wires it. The port itself, and the run-loop logic that calls it,
- * remain fully testable against fakes (see `__tests__/run.test.ts`).
+ * `isBeyondHard()` checks. `dispatchBlindQa` is real there too since ALI-162,
+ * on the same boundary and the same timeout, with a cwd that is deliberately
+ * *not* a worktree — it needs the run's pinned tree passed as port config,
+ * since `BlindDispatchContext` carries no path by design. The port itself, and
+ * the run-loop logic that calls it, remain fully testable against fakes (see
+ * `__tests__/run.test.ts`).
  */
 export interface AgentPort {
   dispatch(seat: Seat, ctx: DispatchContext): Promise<AgentDispatchResult>;

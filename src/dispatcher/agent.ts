@@ -1,6 +1,7 @@
 /**
- * Dispatcher runtime — the real `AgentPort` adapter for the build seats
- * (ALI-161: builder, reviewer, security).
+ * Dispatcher runtime — the real `AgentPort` adapter: the build seats
+ * (ALI-161: builder, reviewer, security) and the blind test-author
+ * (ALI-162: `dispatchBlindQa`).
  *
  * `run.ts` is the run loop; this file is everything about *invoking a seat*:
  * prompt assembly, subprocess management, output parsing, and the
@@ -72,6 +73,42 @@
  *      the parked-work guarantee would never fire. Every dispatch is bounded
  *      by a wall-clock timeout that kills the child and throws.
  *
+ *   4. **The blind test-author's process cannot see the implementation**
+ *      (ALI-162). `dispatchBlindQa` is the *runtime* half of ALI-105's
+ *      guarantee. ALI-105 built the other two halves — extraction (only
+ *      `## Acceptance criteria` / `## Invariant` / `## Definition of done`
+ *      are read) and type asymmetry (`BlindDispatchContext` has none of
+ *      `DispatchContext`'s fields, so the compiler refuses to hand a
+ *      worktree path over) — but neither can stop an *adapter* from setting
+ *      the child's cwd to a worktree or inheriting an environment pointing
+ *      at one. This method is the last place that can break, and the only
+ *      place it can be enforced, on all four channels the invariant names:
+ *
+ *        - **arguments** — argv is `--print`, `--model`, `--setting-sources`
+ *          and the `qa.md` definition; nothing issue-shaped but the seat's
+ *          own five blind fields, and those travel on stdin.
+ *        - **prompt** — assembled from exactly `BlindDispatchContext`'s five
+ *          fields. There is no `worktreePath`/`branch`/diff *available* to
+ *          leak: this method never receives one, so a leak would require
+ *          inventing a path rather than merely forgetting to omit one.
+ *        - **working directory** — a fresh, empty staging directory outside
+ *          every worktree *and* outside the engine checkout (see
+ *          `dispatchBlindQa`'s note on why staging beats writing in place).
+ *          Deliberately unlike the build seats, whose cwd *is* the worktree.
+ *        - **environment** — the same `SEAT_ENV_ALLOWLIST` projection the
+ *          build seats get. It carries no run-specific values at all, so no
+ *          worktree path or branch name can ride in on it.
+ *
+ *      Writes are confined by verification, not by trust: the seat's
+ *      reported file list is checked against what is actually on disk in the
+ *      staging directory, and only then copied into
+ *      `.engine/blind-tests/<ISSUE-ID>/`. A reported path that escapes, a
+ *      file written but not declared, or a symlink is a **hard error**. The
+ *      `tools: Write` allowlist in `qa.md` (CI-enforced by
+ *      `scripts/check-qa-tools-allowlist.js`) is the config half of the same
+ *      property, and the two are independent on purpose — either one failing
+ *      alone still leaves the other standing.
+ *
  * Ports and adapters, same discipline as `run.ts`: the subprocess boundary is
  * the injected `ProcessRunner`, so every criterion above is testable without
  * spawning a real CLI. The filesystem read of the pinned definition is *not*
@@ -81,9 +118,11 @@
  */
 
 import { spawn as spawnProcess } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
 
+import type { BlindDispatchContext } from "./blindqa.js";
 import { modelTier } from "./plan.js";
 import { containsSecretLike, scrubSecrets, type SeatEffort } from "./runlog.js";
 import type {
@@ -202,7 +241,7 @@ export class EngineDefinitionUnreadableError extends AgentDispatchError {
 /** The seat exited non-zero. Never reported as a clean result. */
 export class SeatProcessFailedError extends AgentDispatchError {
   constructor(
-    readonly seat: Seat,
+    readonly seat: DispatchLabel,
     readonly exitCode: number | null,
     /** Already scrubbed (AC7) — safe to log. */
     readonly stderrExcerpt: string,
@@ -243,7 +282,7 @@ export class SeatOutputParseError extends AgentDispatchError {
 /** The per-dispatch wall-clock limit fired; the child was killed. */
 export class SeatDispatchTimeoutError extends AgentDispatchError {
   constructor(
-    readonly seat: Seat,
+    readonly seat: DispatchLabel,
     readonly timeoutMs: number,
   ) {
     super(
@@ -255,17 +294,103 @@ export class SeatDispatchTimeoutError extends AgentDispatchError {
   }
 }
 
-/** Loud stub (ALI-155): the blind QA seat's real adapter is ALI-162's scope, not this issue's. */
-export class BlindQaNotWiredError extends Error {
+/**
+ * The port was constructed without `blindQa` config, so the run's pinned
+ * engine tree — the sole legal source of `.claude/agents/qa.md` — is unknown.
+ *
+ * Fails closed rather than guessing a tree, for exactly the reason
+ * `EngineDefinitionUnreadableError` has no worktree fallback. Deliberately
+ * *not* solved by latching `ctx.enginePath` from an earlier `dispatch()` call
+ * in the same run: that would make an isolation boundary's most trusted input
+ * depend on the order previous seats happened to run in, and would silently
+ * change behaviour if a future run loop ever dispatched blind QA first.
+ */
+export class BlindQaNotConfiguredError extends AgentDispatchError {
   constructor() {
     super(
-      "AgentPort.dispatchBlindQa is a LOUD STUB in this adapter — ALI-161 wires the build seats " +
-        "(builder/reviewer/security) only. ALI-162 wires the blind test-author seat: it takes a " +
-        "different context type (BlindDispatchContext, see blindqa.ts) and carries a different " +
-        "isolation requirement — nothing describing the implementation may reach it — so it is " +
-        "deliberately NOT routed through dispatch(). Do not make this method delegate to dispatch().",
+      "AgentPort.dispatchBlindQa needs the run's pinned engine tree, and this port was built without " +
+        "`blindQa.enginePath`. It cannot come from BlindDispatchContext: that type carries exactly the " +
+        "five blind fields and none of DispatchContext's, which is ALI-105's compiler-enforced asymmetry " +
+        "and must stay that way. Supply `blindQa: { enginePath }` (ALI-104's detached checkout) when " +
+        "constructing the port. Wiring note for ALI-121: runDispatcher() creates that tree itself, " +
+        "mid-run, after RunDeps exists — so hoisting creation ahead of the port must also make " +
+        "EnginePinPort.createPinnedTree idempotent (today `git worktree add` fails on an existing path).",
     );
-    this.name = "BlindQaNotWiredError";
+    this.name = "BlindQaNotConfiguredError";
+  }
+}
+
+/**
+ * The `BlindDispatchContext` handed in is not usable. Two cases, both guarded
+ * *before* anything is interpolated into a path or an argv:
+ *
+ *   - a missing/empty required field — `extractBlindView()` cannot produce
+ *     one, but this method is reachable from JS and from future callers, and
+ *     dispatching a seat with empty criteria would burn a model call to
+ *     produce nothing;
+ *   - an `issueId` that is not an issue identifier. It is a **path segment**
+ *     (`.engine/blind-tests/<ISSUE-ID>/`), so `../../.claude/agents` there
+ *     would relocate the whole artifact directory. Same discipline as
+ *     `isBuildSeat()` guarding the seat name before `join()`.
+ */
+export class BlindQaInvalidContextError extends AgentDispatchError {
+  constructor(reason: string) {
+    super(
+      `blind QA dispatch refused: ${scrubSecrets(reason)}. The blind seat's context is the only input ` +
+        "this dispatch has; a malformed one is a caller bug, never something to paper over with a default.",
+    );
+    this.name = "BlindQaInvalidContextError";
+  }
+}
+
+/**
+ * The blind seat's stdout carried no parseable result envelope, or one that
+ * did not validate (AC4).
+ *
+ * `untestableCriteria` is populated **only** from that envelope. An
+ * unparseable result must never degrade into
+ * `{ testFilesWritten: [], untestableCriteria: [] }`: that value is
+ * indistinguishable from "the seat ran and found every criterion testable",
+ * which is the fake-that-only-says-yes class ALI-155 names, and it would
+ * silently discard ALI-105's AC8 (untestable criteria named by number, never
+ * dropped). The vacuous envelope is refused for the same reason even when the
+ * seat states it explicitly — a seat that wrote no artifact and found nothing
+ * untestable did not do the job qa.md describes.
+ */
+export class BlindQaOutputParseError extends AgentDispatchError {
+  constructor(reason: string) {
+    // `reason` routinely quotes child stdout (a JSON.parse excerpt, an echoed
+    // unknown field name). `AgentDispatchError` scrubs the composed message
+    // (S4); the explicit call marks this as a child-controlled-text path.
+    super(
+      `blind QA seat produced no valid result envelope: ${scrubSecrets(reason)}. ` +
+        `Expected exactly one line beginning ${BLIND_QA_RESULT_SENTINEL} followed by a JSON object ` +
+        "carrying testFilesWritten and untestableCriteria. Refusing to report an empty blind result for " +
+        "output this runtime cannot understand — an empty result reads as `every criterion was testable`.",
+    );
+    this.name = "BlindQaOutputParseError";
+  }
+}
+
+/**
+ * The blind seat's writes were not confined to its artifact directory (AC3).
+ *
+ * A **hard error, never a warning**: the quarantine is what keeps a
+ * diff-authoring seat from ever being able to edit an assertion, and what
+ * keeps a Write-only seat from reaching the pinned definitions a later seat in
+ * the same run reads (S3's class). Covers a reported path that escapes the
+ * directory, a file present on disk but never declared, a declared file that
+ * does not exist, and a symlink (a write *through* which lands outside).
+ */
+export class BlindQaArtifactError extends AgentDispatchError {
+  constructor(reason: string) {
+    super(
+      `blind QA artifact rejected: ${scrubSecrets(reason)}. Writes are confined to ` +
+        `${join(...BLIND_TESTS_DIR_SEGMENTS, "<ISSUE-ID>")}/ and that confinement is verified against ` +
+        "the filesystem, not taken on trust. qa.md's `tools: Write` allowlist is the independent config " +
+        "half of this control, never a substitute for it.",
+    );
+    this.name = "BlindQaArtifactError";
   }
 }
 
@@ -273,13 +398,56 @@ export class BlindQaNotWiredError extends Error {
 // Seats and the model pin
 // ---------------------------------------------------------------------------
 
-/** The three seats this adapter invokes. `blindQa` is deliberately absent — different method, different context type. */
+/** The three seats `dispatch()` invokes. `blindQa` is deliberately absent — different method, different context type. */
 export const BUILD_SEATS: readonly Seat[] = ["builder", "reviewer", "security"] as const;
 
 const BUILD_SEAT_SET: ReadonlySet<string> = new Set(BUILD_SEATS);
 
 export function isBuildSeat(value: string): value is Seat {
   return BUILD_SEAT_SET.has(value);
+}
+
+/**
+ * The blind test-author's definition name — `.claude/agents/qa.md`. Not a
+ * `Seat`: `Seat` is the union `dispatch()` accepts, and keeping the blind seat
+ * out of it is what makes "wired through the wrong method" a type error rather
+ * than a convention (see `UnknownSeatError`).
+ */
+export const BLIND_QA_DEFINITION = "qa" as const;
+
+/** Anything this adapter can invoke, for the error/label surface shared by both methods. */
+export type DispatchLabel = Seat | typeof BLIND_QA_DEFINITION;
+
+/**
+ * The blind seat's model pin (AC1). A **fixed** tier, unlike the build seats'
+ * `max(pointsTier, riskTier)`, and that is not a shortcut: `modelTier()` reads
+ * the issue's points and labels, and `BlindDispatchContext` carries neither —
+ * by design, since the blind view is exactly five fields. The roster fixes the
+ * tier instead (docs/ENGINE.md §2: "Blind QA | Sonnet", the cheap tier,
+ * because its output is verified downstream by the reviewer and CI). A test
+ * asserts this constant still matches `qa.md`'s own `model:` frontmatter, so
+ * the config half and the runtime half cannot drift apart silently.
+ */
+export const BLIND_QA_TIER: ModelTier = "sonnet";
+
+/**
+ * Where the blind seat's artifact lives, relative to the engine checkout root
+ * — `.engine/blind-tests/<ISSUE-ID>/`, the location `qa.md`'s artifact
+ * contract calls "fixed and non-negotiable", under the same `.engine/` root
+ * `run.ts`'s `runLogPath()` already writes into.
+ */
+export const BLIND_TESTS_DIR_SEGMENTS: readonly string[] = Object.freeze([".engine", "blind-tests"]);
+
+/**
+ * Issue identifiers this adapter will interpolate into that path. Anchored and
+ * deliberately narrow: the value becomes a directory name, so `..`, a
+ * separator, a NUL, or a leading dash must never survive the guard.
+ */
+export const BLIND_QA_ISSUE_ID_PATTERN = /^[A-Z][A-Z0-9]{0,15}-[0-9]{1,9}$/;
+
+/** `.engine/blind-tests/<ISSUE-ID>` — call only with an `issueId` already checked against the pattern above. */
+export function blindTestsRelativeDir(issueId: string): string {
+  return join(...BLIND_TESTS_DIR_SEGMENTS, issueId);
 }
 
 /**
@@ -652,8 +820,12 @@ function parseBounceDetail(seat: Seat, value: unknown): BounceDetail {
 // Prompt assembly — read only from the pinned engine tree (AC3)
 // ---------------------------------------------------------------------------
 
-/** Where a seat's definition lives inside the pinned tree, relative to its root. */
-export function seatDefinitionRelativePath(seat: Seat): string {
+/**
+ * Where a seat's definition lives inside the pinned tree, relative to its root.
+ * Accepts the blind seat's name too (`qa.md`) — same tree, same pin, same
+ * no-fallback rule.
+ */
+export function seatDefinitionRelativePath(seat: DispatchLabel): string {
   return join(".claude", "agents", `${seat}.md`);
 }
 
@@ -684,7 +856,7 @@ function issueBody(issue: DispatchContext["issue"]): string {
  * run would read — property 1 defeated through the trusted path. The seat needs
  * no path: its instructions are already here.
  */
-function renderSeatSystemPrompt(params: { seat: Seat; definition: string }): string {
+function renderSeatSystemPrompt(params: { seat: DispatchLabel; definition: string }): string {
   const { seat, definition } = params;
   return [
     `<seat name="${seat}">`,
@@ -747,6 +919,348 @@ function renderWorkPrompt(params: { ctx: DispatchContext }): string {
 }
 
 // ---------------------------------------------------------------------------
+// The blind test-author: its own envelope, its own prompt, its own artifact
+// verification (ALI-162)
+// ---------------------------------------------------------------------------
+
+/**
+ * The blind seat ends its run by printing exactly one line of this shape:
+ *
+ *   ENGINE-BLIND-QA-RESULT: {"testFilesWritten":["manifest.json"],"untestableCriteria":[4]}
+ *
+ * A **different** sentinel from the build seats' `SEAT_RESULT_SENTINEL`, for
+ * the same reason `BlindQaDispatchResult` is a different type from
+ * `AgentDispatchResult`: the blind seat has no `summary` and no `ambiguous`,
+ * and its "I could not do this" signal must never be able to route through
+ * `finalizeNeedsPedro()` (ALI-105 AC8). Sharing one envelope would make that
+ * a matter of care; two sentinels make it a matter of shape.
+ */
+export const BLIND_QA_RESULT_SENTINEL = "ENGINE-BLIND-QA-RESULT:";
+
+/** The only fields the blind envelope may carry. Anything else is refused. */
+const BLIND_ENVELOPE_KEYS: readonly string[] = [
+  "testFilesWritten",
+  "untestableCriteria",
+  "tokensUsed",
+  "model",
+  "effort",
+];
+
+/** `manifest.json` is mandatory per `qa.md`'s artifact contract — it is what traces each test file to its criterion. */
+export const BLIND_QA_MANIFEST_FILENAME = "manifest.json";
+
+/** What the seat *claims*, straight out of its envelope. Every path here is still unverified. */
+export interface BlindQaEnvelope {
+  /** Paths as the seat reported them — relative to its working directory, not yet confined. */
+  reportedFiles: string[];
+  untestableCriteria: number[];
+  tokensUsed?: number;
+  model?: ModelTier;
+  effort?: SeatEffort;
+}
+
+/**
+ * Strictly parses the blind seat's stdout, or throws `BlindQaOutputParseError`.
+ * Same strictness in both directions as `parseSeatResult`, plus one rule of its
+ * own: the vacuous envelope (`{ testFilesWritten: [], untestableCriteria: [] }`)
+ * is refused, because that exact value is what AC4 names as indistinguishable
+ * from a successful run.
+ */
+export function parseBlindQaResult(stdout: string): BlindQaEnvelope {
+  const lines = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith(BLIND_QA_RESULT_SENTINEL));
+
+  if (lines.length === 0) throw new BlindQaOutputParseError("no result line found in stdout");
+  if (lines.length > 1) {
+    throw new BlindQaOutputParseError(
+      `${lines.length} result lines found — exactly one is required, so the authoritative result is unambiguous`,
+    );
+  }
+
+  const payload = lines[0].slice(BLIND_QA_RESULT_SENTINEL.length).trim();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch (cause) {
+    throw new BlindQaOutputParseError(
+      `result line is not valid JSON (${cause instanceof Error ? cause.message : String(cause)})`,
+    );
+  }
+
+  if (!isPlainObject(parsed)) throw new BlindQaOutputParseError("result line is not a JSON object");
+
+  const extra = unknownKeys(parsed, BLIND_ENVELOPE_KEYS);
+  if (extra.length > 0) {
+    throw new BlindQaOutputParseError(
+      `unrecognized field(s) ${extra.join(", ")} — this runtime cannot honor a signal it does not implement`,
+    );
+  }
+
+  const reportedFiles = parseReportedFiles(parsed.testFilesWritten);
+  const untestableCriteria = parseUntestableCriteria(parsed.untestableCriteria);
+
+  // AC4, stated as the criterion states it.
+  if (reportedFiles.length === 0 && untestableCriteria.length === 0) {
+    throw new BlindQaOutputParseError(
+      "the envelope reports no test files AND no untestable criteria — that value cannot be told apart from " +
+        "`the seat ran and found every criterion testable`, so it is refused rather than recorded",
+    );
+  }
+
+  const envelope: BlindQaEnvelope = { reportedFiles, untestableCriteria };
+
+  if (parsed.tokensUsed !== undefined) {
+    if (typeof parsed.tokensUsed !== "number" || !Number.isFinite(parsed.tokensUsed) || parsed.tokensUsed < 0) {
+      throw new BlindQaOutputParseError("`tokensUsed` must be a finite, non-negative number when present");
+    }
+    envelope.tokensUsed = parsed.tokensUsed;
+  }
+
+  // Same discipline as the build seats (ALI-106 AC3): never back-filled from
+  // the tier this adapter pinned, or a seat that ran at another tier than the
+  // roster predicts becomes unobservable.
+  if (parsed.model !== undefined) {
+    if (typeof parsed.model !== "string" || !MODEL_TIERS.includes(parsed.model as ModelTier)) {
+      throw new BlindQaOutputParseError(`\`model\` must be one of ${MODEL_TIERS.join("|")} when present`);
+    }
+    envelope.model = parsed.model as ModelTier;
+  }
+
+  if (parsed.effort !== undefined) {
+    if (typeof parsed.effort !== "string" || !SEAT_EFFORTS.includes(parsed.effort as SeatEffort)) {
+      throw new BlindQaOutputParseError(`\`effort\` must be one of ${SEAT_EFFORTS.join("|")} when present`);
+    }
+    envelope.effort = parsed.effort as SeatEffort;
+  }
+
+  return envelope;
+}
+
+function parseReportedFiles(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    throw new BlindQaOutputParseError("`testFilesWritten` is required and must be an array of relative paths");
+  }
+  return value.map((entry) => {
+    if (typeof entry !== "string" || entry.trim() === "") {
+      throw new BlindQaOutputParseError("`testFilesWritten` entries must be non-empty strings");
+    }
+    return entry.trim();
+  });
+}
+
+function parseUntestableCriteria(value: unknown): number[] {
+  if (!Array.isArray(value)) {
+    throw new BlindQaOutputParseError(
+      "`untestableCriteria` is required and must be an array of criterion numbers — ALI-105 AC8 is that an " +
+        "untestable criterion is named by number and never dropped, so its absence is not the same as `[]`",
+    );
+  }
+  const numbers = value.map((entry) => {
+    if (typeof entry !== "number" || !Number.isInteger(entry) || entry < 1) {
+      throw new BlindQaOutputParseError("`untestableCriteria` entries must be positive integers (criterion numbers)");
+    }
+    return entry;
+  });
+  if (new Set(numbers).size !== numbers.length) {
+    throw new BlindQaOutputParseError("`untestableCriteria` names the same criterion twice");
+  }
+  return numbers;
+}
+
+/**
+ * The blind work prompt. Assembled from exactly `BlindDispatchContext`'s five
+ * fields — the compiler cannot hand this function a worktree path, a branch or
+ * a diff, because the type it takes has no such field (ALI-105's asymmetry),
+ * and this function reaches for nothing else.
+ *
+ * Carries **no filesystem path at all**, absolute or relative: not the pinned
+ * tree (S3 — the seat holds `Write`, and a disclosed engine path is an
+ * invitation to edit the definitions a later seat reads), not the artifact
+ * root, not even the staging directory the child is already sitting in. The
+ * seat writes plain filenames into its own cwd; the runtime does the rest.
+ */
+function renderBlindWorkPrompt(ctx: BlindDispatchContext): string {
+  return [
+    `<issue id="${ctx.issueId}">`,
+    `title: ${ctx.title}`,
+    "</issue>",
+    "",
+    "<acceptance-criteria>",
+    ctx.acceptanceCriteria.trimEnd(),
+    "</acceptance-criteria>",
+    "",
+    "<invariant>",
+    ctx.invariant.trim() === "" ? "(none stated)" : ctx.invariant.trimEnd(),
+    "</invariant>",
+    "",
+    "<definition-of-done>",
+    ctx.definitionOfDone.trim() === "" ? "(none stated)" : ctx.definitionOfDone.trimEnd(),
+    "</definition-of-done>",
+    "",
+    "<artifact-contract>",
+    "Write your test files and " +
+      BLIND_QA_MANIFEST_FILENAME +
+      " into your CURRENT WORKING DIRECTORY, using plain relative filenames.",
+    `The runtime places whatever you write there into ${join(...BLIND_TESTS_DIR_SEGMENTS, "<ISSUE-ID>")}/ at the` +
+      " engine checkout root — you do not need, and must not construct, that prefix or any absolute path.",
+    "Do not write outside your working directory (no absolute paths, no `..`, no symlinks): the runtime verifies",
+    "this against the filesystem and refuses the whole dispatch if a write escapes.",
+    `Every file you write must be declared in ${BLIND_QA_RESULT_SENTINEL}'s testFilesWritten — an undeclared file`,
+    "is also a refusal, and so is a declared file that is not there.",
+    "</artifact-contract>",
+    "",
+    "<output-contract>",
+    "End your run by printing EXACTLY ONE line of the form:",
+    `${BLIND_QA_RESULT_SENTINEL} {"testFilesWritten":["${BLIND_QA_MANIFEST_FILENAME}","ac-1.test.ts"],"untestableCriteria":[]}`,
+    "",
+    "The JSON object accepts only these fields:",
+    "  testFilesWritten   (string[], required) — every file you wrote, relative to your working directory.",
+    "  untestableCriteria (number[], required) — the NUMBERS of acceptance criteria you could not write a test",
+    "                                            for. Never guessed into a test, never silently dropped; `[]`",
+    "                                            only if every criterion got one.",
+    "  tokensUsed         (number)             — tokens this dispatch consumed.",
+    '  model              ("haiku"|"sonnet"|"opus") — the tier you ACTUALLY ran at, as you observe it.',
+    '  effort             ("standard"|"lint"|"judgment").',
+    "",
+    "Any other field, a second result line, a non-zero exit, or an envelope reporting neither files nor",
+    "untestable criteria is a hard failure: the runtime refuses the dispatch rather than reporting an empty",
+    "blind result, which would read as `every criterion was testable`.",
+    "",
+    "You never run the tests you write. Nothing here names an implementation, a branch, a diff or a file under",
+    "review — that is deliberate, and you do not ask for any of it.",
+    "</output-contract>",
+  ].join("\n");
+}
+
+/**
+ * Walks a staging directory and returns every regular file in it, as paths
+ * relative to the root, sorted.
+ *
+ * `withFileTypes` + an explicit type check per entry, rather than a plain
+ * `readdir`: a **symlink** inside the artifact is a write-escape vector (the
+ * bytes land wherever it points, and the reviewer later reads the target), so
+ * it is refused rather than followed. Anything that is not a directory or a
+ * regular file is refused for the same reason.
+ */
+async function walkArtifactFiles(root: string, dir = root): Promise<string[]> {
+  const entries = await readdir(dir, { withFileTypes: true });
+  const files: string[] = [];
+  for (const entry of entries) {
+    const absolute = join(dir, entry.name);
+    const relativePath = absolute.slice(root.length + 1);
+    if (entry.isDirectory()) {
+      files.push(...(await walkArtifactFiles(root, absolute)));
+    } else if (entry.isSymbolicLink()) {
+      throw new BlindQaArtifactError(
+        `${relativePath} is a symlink — a write through it lands outside the artifact directory, so the ` +
+          "artifact is refused rather than followed",
+      );
+    } else if (entry.isFile()) {
+      files.push(relativePath);
+    } else {
+      throw new BlindQaArtifactError(`${relativePath} is neither a regular file nor a directory`);
+    }
+  }
+  return files.sort();
+}
+
+/**
+ * Normalizes one reported path and refuses anything that could land outside
+ * the staging directory: absolute paths, `..` traversal, and (defensively) a
+ * resolved path that is not under the root even after normalization.
+ */
+function confineReportedPath(stagingDir: string, reported: string): string {
+  if (isAbsolute(reported)) {
+    throw new BlindQaArtifactError(`reported path ${JSON.stringify(reported)} is absolute`);
+  }
+  const normalized = normalize(reported);
+  if (normalized === "." || normalized === "" || normalized.endsWith(sep)) {
+    throw new BlindQaArtifactError(`reported path ${JSON.stringify(reported)} does not name a file`);
+  }
+  if (normalized === ".." || normalized.startsWith(`..${sep}`)) {
+    throw new BlindQaArtifactError(
+      `reported path ${JSON.stringify(reported)} escapes the artifact directory via ..`,
+    );
+  }
+  // Belt-and-braces after the syntactic checks above: whatever the path looked
+  // like, its resolved form must sit strictly inside the staging root.
+  if (!resolve(stagingDir, normalized).startsWith(resolve(stagingDir) + sep)) {
+    throw new BlindQaArtifactError(`reported path ${JSON.stringify(reported)} resolves outside the artifact directory`);
+  }
+  return normalized;
+}
+
+/**
+ * AC3, end to end: verify what the seat wrote, then publish it.
+ *
+ * The seat's own list is never taken on trust — it is reconciled against the
+ * filesystem in **both** directions, because each direction hides a different
+ * failure: a declared-but-absent file means the report is fiction, and a
+ * present-but-undeclared file means the seat wrote something it did not admit
+ * to. Only after both agree does anything land under
+ * `.engine/blind-tests/<ISSUE-ID>/`.
+ *
+ * Returns the artifact's paths relative to the engine checkout root — the
+ * shape `BlindQaDispatchResult.testFilesWritten` documents, and one that keeps
+ * absolute paths out of the run log.
+ */
+async function publishBlindArtifact(params: {
+  issueId: string;
+  stagingDir: string;
+  artifactRoot: string;
+  reported: readonly string[];
+}): Promise<string[]> {
+  const { issueId, stagingDir, artifactRoot, reported } = params;
+
+  const declared = new Set<string>();
+  for (const entry of reported) {
+    const confined = confineReportedPath(stagingDir, entry);
+    if (declared.has(confined)) {
+      throw new BlindQaArtifactError(`${confined} is declared twice in testFilesWritten`);
+    }
+    declared.add(confined);
+  }
+
+  const onDisk = new Set(await walkArtifactFiles(stagingDir));
+
+  const missing = [...declared].filter((path) => !onDisk.has(path)).sort();
+  if (missing.length > 0) {
+    throw new BlindQaArtifactError(`declared but not written: ${missing.join(", ")}`);
+  }
+
+  const undeclared = [...onDisk].filter((path) => !declared.has(path)).sort();
+  if (undeclared.length > 0) {
+    throw new BlindQaArtifactError(`written but not declared: ${undeclared.join(", ")}`);
+  }
+
+  // qa.md's artifact contract: the test files "plus one `manifest.json` per
+  // issue mapping each test file to the numbered acceptance criterion (or the
+  // invariant) it traces to". Without it the artifact cannot be traced back to
+  // the criteria, which is the only thing that makes it a blind *test* suite
+  // rather than a pile of files.
+  const hasManifest = [...declared].some((path) => path.split(sep).pop() === BLIND_QA_MANIFEST_FILENAME);
+  if (!hasManifest) {
+    throw new BlindQaArtifactError(
+      `no ${BLIND_QA_MANIFEST_FILENAME} in the artifact — qa.md's contract requires one per issue, tracing each ` +
+        "test file to the numbered criterion (or the invariant) it came from",
+    );
+  }
+
+  const relativeDir = blindTestsRelativeDir(issueId);
+  const destinationDir = join(artifactRoot, relativeDir);
+  const published: string[] = [];
+  for (const path of [...declared].sort()) {
+    const destination = join(destinationDir, path);
+    await mkdir(dirname(destination), { recursive: true });
+    await copyFile(join(stagingDir, path), destination);
+    published.push(join(relativeDir, path));
+  }
+  return published;
+}
+
+// ---------------------------------------------------------------------------
 // The adapter
 // ---------------------------------------------------------------------------
 
@@ -764,9 +1278,53 @@ export const DEFAULT_AGENT_COMMAND = "claude";
 /** How much scrubbed stderr a failure message carries. Bounded so a chatty crash cannot flood the run log. */
 const STDERR_EXCERPT_LIMIT = 2000;
 
+/**
+ * What `dispatchBlindQa` needs and cannot be handed per-dispatch (ALI-162).
+ *
+ * Both values are **run-level constants**, not per-issue data, which is why
+ * they belong on the port rather than on the context: `BlindDispatchContext` is
+ * exactly the five blind fields, and widening it — even with something as
+ * innocuous as a path to a read-only tree — would reopen the channel ALI-105
+ * closed with the compiler.
+ */
+export interface BlindQaSeatConfig {
+  /**
+   * The run's pinned engine tree (ALI-104's detached checkout) — the sole legal
+   * source of `.claude/agents/qa.md`, on exactly the same no-fallback terms as
+   * the build seats' definitions.
+   */
+  enginePath: string;
+  /**
+   * Root that `.engine/blind-tests/<ISSUE-ID>/` resolves against: the engine
+   * checkout root, per `qa.md`'s artifact contract, and **never** a builder
+   * worktree — the quarantine is what stops a diff-authoring seat editing an
+   * assertion. Defaults to `process.cwd()`, the same default (and the same
+   * reasoning) as `run.ts`'s `writeRunLog(..., baseDir)`.
+   *
+   * A deployment may point this at a directory outside the engine checkout
+   * entirely; this adapter only ever writes under
+   * `<artifactRoot>/.engine/blind-tests/<ISSUE-ID>/` and does not care what is
+   * above it.
+   */
+  artifactRoot?: string;
+  /**
+   * Where each dispatch's throwaway staging directory is created. Defaults to
+   * the OS temp dir. Injectable so the confinement tests can watch a real
+   * directory without writing into the repo.
+   */
+  stagingRoot?: string;
+}
+
 export interface ClaudeCliAgentConfig {
   /** The injected subprocess boundary. `createNodeProcessRunner()` is the real one. */
   runner: ProcessRunner;
+  /**
+   * Enables the blind test-author seat. Omitted → `dispatchBlindQa` throws
+   * `BlindQaNotConfiguredError`. Loud rather than optional-and-silent: an
+   * adapter that quietly reported an empty blind result would be the
+   * fake-that-only-says-yes ALI-155 names.
+   */
+  blindQa?: BlindQaSeatConfig;
   /** Per-dispatch wall-clock limit in ms. Defaults to `DEFAULT_SEAT_TIMEOUT_MS`. Must be > 0. */
   timeoutMs?: number;
   /** Executable to invoke. Defaults to `DEFAULT_AGENT_COMMAND`. */
@@ -780,9 +1338,10 @@ export interface ClaudeCliAgentConfig {
 }
 
 /**
- * The real `AgentPort` for the build seats. Replaces the throw-only stub this
- * port carried since ALI-103 — with one method still stubbed, loudly and by
- * name: `dispatchBlindQa` is ALI-162's scope (AC9).
+ * The real `AgentPort`: `dispatch()` for the build seats (ALI-161) and
+ * `dispatchBlindQa()` for the blind test-author (ALI-162). No method here is a
+ * stub any more; the one thing that is still optional is the blind seat's
+ * *configuration*, and its absence fails loudly rather than quietly.
  */
 export function createClaudeCliAgentPort(config: ClaudeCliAgentConfig): AgentPort {
   const timeoutMs = config.timeoutMs ?? DEFAULT_SEAT_TIMEOUT_MS;
@@ -791,6 +1350,25 @@ export function createClaudeCliAgentPort(config: ClaudeCliAgentConfig): AgentPor
       `invalid per-dispatch timeout ${String(config.timeoutMs)} — a seat with no finite bound could hold ` +
         "the run past its hard backstop forever, which is the defect this timeout exists to prevent",
     );
+  }
+  // Blind-seat paths are checked at construction, not at dispatch: a relative
+  // root resolves against whatever `process.cwd()` happens to be when the run
+  // fires, which for an unattended Routine is not a value anyone chose. Better
+  // to refuse the port than to publish an artifact somewhere surprising.
+  if (config.blindQa !== undefined) {
+    for (const [field, value] of Object.entries({
+      enginePath: config.blindQa.enginePath,
+      artifactRoot: config.blindQa.artifactRoot,
+      stagingRoot: config.blindQa.stagingRoot,
+    })) {
+      if (value === undefined) continue;
+      if (typeof value !== "string" || value.trim() === "" || !isAbsolute(value)) {
+        throw new AgentDispatchError(
+          `blindQa.${field} must be an absolute path (got ${JSON.stringify(value)}) — the blind seat's artifact ` +
+            "location and its pinned definition are both resolved without reference to the process's cwd",
+        );
+      }
+    }
   }
   const command = config.command ?? DEFAULT_AGENT_COMMAND;
   const envSource = config.envSource ?? process.env;
@@ -825,7 +1403,7 @@ export function createClaudeCliAgentPort(config: ClaudeCliAgentConfig): AgentPor
         stdin: renderWorkPrompt({ ctx }),
       });
 
-      const result = await raceWithTimeout(seat, handle, timeoutMs);
+      const result = await raceWithTimeout(handle, timeoutMs, () => new SeatDispatchTimeoutError(seat, timeoutMs));
 
       // Scrub before anything reaches a message, a summary, or the run log (AC7).
       if (result.exitCode !== 0) {
@@ -840,28 +1418,176 @@ export function createClaudeCliAgentPort(config: ClaudeCliAgentConfig): AgentPor
     },
 
     /**
-     * AC9 — loud stub, ALI-162 named. Throws *synchronously* (not a rejected
-     * promise) so a caller that forgets to await still fails immediately and
-     * visibly, matching the treatment the previous stub had.
+     * The blind test-author (ALI-162) — property 4 in this file's header.
+     *
+     * Deliberately **not** routed through `dispatch()`, and not merely for
+     * type reasons: every difference below is a place the two seats must not
+     * share behaviour.
+     *
+     *   - **cwd is a fresh staging directory**, not a worktree. The build
+     *     seats' cwd *is* the worktree because that is where the work happens;
+     *     for this seat, a worktree cwd would hand over the entire
+     *     implementation through the one channel neither the extraction nor
+     *     the type asymmetry can reach. Staging beats writing straight into
+     *     `.engine/blind-tests/<ISSUE-ID>/` on two counts: the directory
+     *     starts **empty**, so "exactly the paths written" needs no
+     *     before/after bookkeeping to be exact; and its ancestors contain
+     *     neither the engine checkout nor any worktree, so even a relative
+     *     `../../..` write — the one escape a Write-only seat could still
+     *     attempt — reaches nothing load-bearing. The artifact is copied into
+     *     place only after verification.
+     *   - **The model pin is fixed** (`BLIND_QA_TIER`), because the blind
+     *     context carries no points and no labels to compute a tier from.
+     *   - **A different result envelope**, so an untestable criterion can
+     *     never be mistaken for a builder's `ambiguous` (ALI-105 AC8).
+     *
+     * Everything the two seats *do* share is shared on purpose: the injected
+     * `ProcessRunner`, the pinned-tree read with no fallback, the
+     * `--setting-sources user` suppression of cwd-rooted discovery, the
+     * `--system-prompt` channel that actually governs, the env allowlist, and
+     * the per-dispatch timeout (AC5 — a hung blind seat makes the hard
+     * backstop at `run.ts`'s post-builder checkpoint unreachable exactly as a
+     * hung builder would).
      */
-    dispatchBlindQa(): Promise<BlindQaDispatchResult> {
-      throw new BlindQaNotWiredError();
+    async dispatchBlindQa(ctx: BlindDispatchContext): Promise<BlindQaDispatchResult> {
+      const blindConfig = config.blindQa;
+      if (
+        blindConfig === undefined ||
+        typeof blindConfig.enginePath !== "string" ||
+        blindConfig.enginePath.trim() === ""
+      ) {
+        throw new BlindQaNotConfiguredError();
+      }
+      // Guard the context before anything is interpolated into a path or an
+      // argv — `issueId` becomes a directory name.
+      assertBlindContext(ctx);
+
+      const definitionPath = join(blindConfig.enginePath, seatDefinitionRelativePath(BLIND_QA_DEFINITION));
+      let definition: string;
+      try {
+        definition = await readFile(definitionPath, "utf8");
+      } catch (cause) {
+        // Same terminal treatment as the build seats: no fallback tree, ever.
+        throw new EngineDefinitionUnreadableError(definitionPath, cause);
+      }
+
+      const artifactRoot = blindConfig.artifactRoot ?? process.cwd();
+      const stagingRoot = blindConfig.stagingRoot ?? tmpdir();
+      await mkdir(stagingRoot, { recursive: true });
+      // `mkdtemp` gives a directory that did not exist a moment ago and is not
+      // shared with any other dispatch — no stale artifact can be mistaken for
+      // this seat's output, and no other seat can read this one's.
+      const stagingDir = await mkdtemp(join(stagingRoot, "engine-blind-qa-"));
+
+      try {
+        const handle = config.runner.spawn({
+          command,
+          args: buildSeatArgv({
+            modelId: TIER_MODEL_IDS[BLIND_QA_TIER],
+            systemPrompt: renderSeatSystemPrompt({ seat: BLIND_QA_DEFINITION, definition }),
+          }),
+          cwd: stagingDir,
+          // The same allowlist projection the build seats get. It carries no
+          // run-specific value at all, so there is nothing worktree- or
+          // branch-shaped for the environment channel to leak.
+          env: buildSeatEnv(envSource),
+          stdin: renderBlindWorkPrompt(ctx),
+        });
+
+        const result = await raceWithTimeout(
+          handle,
+          timeoutMs,
+          () => new SeatDispatchTimeoutError(BLIND_QA_DEFINITION, timeoutMs),
+        );
+
+        if (result.exitCode !== 0) {
+          throw new SeatProcessFailedError(
+            BLIND_QA_DEFINITION,
+            result.exitCode,
+            scrubSecrets(result.stderr).trim().slice(0, STDERR_EXCERPT_LIMIT),
+          );
+        }
+
+        // AC4: only the structured envelope populates `untestableCriteria`, and
+        // output this runtime cannot understand throws rather than resolving.
+        const envelope = parseBlindQaResult(result.stdout);
+
+        // AC3: verified against the filesystem, then published.
+        const testFilesWritten = await publishBlindArtifact({
+          issueId: ctx.issueId,
+          stagingDir,
+          artifactRoot,
+          reported: envelope.reportedFiles,
+        });
+
+        const blindResult: BlindQaDispatchResult = {
+          testFilesWritten,
+          untestableCriteria: envelope.untestableCriteria,
+        };
+        if (envelope.tokensUsed !== undefined) blindResult.tokensUsed = envelope.tokensUsed;
+        if (envelope.model !== undefined) blindResult.model = envelope.model;
+        if (envelope.effort !== undefined) blindResult.effort = envelope.effort;
+        return blindResult;
+      } finally {
+        // The staging directory is throwaway by design: on the happy path its
+        // contents are already published, and on every failure path the named
+        // error carries what went wrong. Leaving it behind would accumulate
+        // partial artifacts under the temp root for every bounced dispatch.
+        await rm(stagingDir, { recursive: true, force: true }).catch(() => {
+          /* best-effort cleanup: never mask the real outcome of the dispatch */
+        });
+      }
     },
   };
 }
 
 /**
- * Bounds one dispatch. Kills the child and throws `SeatDispatchTimeoutError`
+ * Rejects a `BlindDispatchContext` this adapter must not act on. Not paranoia
+ * about `extractBlindView()` — it cannot produce either failure — but about the
+ * fact that `issueId` is used as a **path segment**, and that a dispatch with
+ * empty criteria would spend a model call proving nothing.
+ */
+function assertBlindContext(ctx: BlindDispatchContext): void {
+  if (typeof ctx?.issueId !== "string" || !BLIND_QA_ISSUE_ID_PATTERN.test(ctx.issueId)) {
+    throw new BlindQaInvalidContextError(
+      `issueId ${JSON.stringify(ctx?.issueId)} is not an issue identifier, and it is used as a directory name`,
+    );
+  }
+  if (typeof ctx.title !== "string" || ctx.title.trim() === "") {
+    throw new BlindQaInvalidContextError("title is required");
+  }
+  if (typeof ctx.acceptanceCriteria !== "string" || ctx.acceptanceCriteria.trim() === "") {
+    throw new BlindQaInvalidContextError(
+      "acceptanceCriteria is empty — the blind seat writes tests from the criteria and nothing else, so there " +
+        "is nothing to dispatch it with (run.ts's unparseable-view branch is the path that handles this loudly)",
+    );
+  }
+  if (typeof ctx.invariant !== "string" || typeof ctx.definitionOfDone !== "string") {
+    throw new BlindQaInvalidContextError("invariant and definitionOfDone must be strings (empty is allowed)");
+  }
+}
+
+/**
+ * Bounds one dispatch. Kills the child and throws whatever `onTimeout` builds
  * if the limit fires first. The loser of the race gets a no-op catch attached
  * so a late rejection from a killed child never surfaces as an unhandled
  * rejection and takes the run down.
+ *
+ * The error arrives as a factory rather than a seat name so both dispatch
+ * methods share one bound: ALI-162's blind seat needs the same guarantee for
+ * the same reason (a hung seat makes the run-level hard backstop unreachable),
+ * and a second copy of this race is a second place for it to drift.
  *
  * `handle.kill()` is wrapped so a throwing implementation cannot escape the
  * timer callback (S5 nit): an uncaught exception inside `setTimeout` is fatal
  * to the whole dispatcher process, which would turn "one seat is stuck" into
  * "the run dies without parking its work".
  */
-async function raceWithTimeout(seat: Seat, handle: ProcessHandle, timeoutMs: number): Promise<ProcessResult> {
+async function raceWithTimeout(
+  handle: ProcessHandle,
+  timeoutMs: number,
+  onTimeout: () => AgentDispatchError,
+): Promise<ProcessResult> {
   const exited = handle.exited;
   exited.catch(() => {
     /* the timeout path may abandon this promise; never let it go unhandled */
@@ -879,7 +1605,7 @@ async function raceWithTimeout(seat: Seat, handle: ProcessHandle, timeoutMs: num
             // Reclaiming the child is best-effort; an exception here must never
             // escape the timer callback (see this function's doc comment).
           }
-          reject(new SeatDispatchTimeoutError(seat, timeoutMs));
+          reject(onTimeout());
         }, timeoutMs);
       }),
     ]);
