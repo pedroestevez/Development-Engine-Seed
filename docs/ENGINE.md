@@ -55,7 +55,7 @@ A subagent file is a **role**, not a worker. The orchestrator spins up as many c
 **A status earns its place only if the engine behaves differently for it.** That test is why there is no separate `Triage`: to the build loop, Triage and Backlog both mean *not admissible*, so a second status for it enforces nothing. Raw candidates go to Backlog carrying the `research` label; the Planner curates from there. Revisit only when researcher volume justifies Linear's native Triage inbox.
 
 1. **Backlog** — the holding pool. Raw candidates and groomed-but-uncommitted work both live here. The build loop **never reads Backlog**. Planner-suggested promotion out of it is curation, **not a gate**; nothing in it is a commitment to build.
-2. **→ Ready** — triggered by **cycle nomination**: when the Planner nominates Backlog issues for the next cycle, the Readiness/Spec pass enriches them (points, definition of done, risk labels, ambiguity removed) and **checks each is buildable** against the seven gate questions in `spec.md` — including that `weighted_cost ≤ run budget`, because an issue too large for one run is by definition not Ready. Passes → **Ready**; fails → **Needs Pedro** *now*, in planning, not at 2am mid-build. **Human-action issues** — reversibility class `human-action`, executable only by Pedro — are exempt from the estimate and budget gates, are never estimated, and go to **Needs Pedro** rather than counting as readiness failures. Speccing a nominee Pedro later rejects costs a few tokens — accepted, so approval is over **pointed, spec'd issues, not vibes**.
+2. **→ Ready** — triggered by **cycle nomination**: when the Planner nominates Backlog issues for the next cycle, the Readiness/Spec pass enriches them (points, definition of done, risk labels, ambiguity removed) and **checks each is buildable** against the eight gate questions in `spec.md` — including that `weighted_cost ≤ run budget`, because an issue too large for one run is by definition not Ready. Passes → **Ready**; fails → **Needs Pedro** *now*, in planning, not at 2am mid-build. **Human-action issues** — reversibility class `human-action`, executable only by Pedro — are exempt from the estimate and budget gates, are never estimated, and go to **Needs Pedro** rather than counting as readiness failures. Speccing a nominee Pedro later rejects costs a few tokens — accepted, so approval is over **pointed, spec'd issues, not vibes**.
 3. **Cycle approval — the Direction gate.** The Planner composes the proposed cycle from Ready issues; the proposal reaches Pedro on the escalation channel (§12); **one tap approves**. No approved cycle → nothing runs (**fail closed**). Change of mind mid-cycle: pull an item and unstarted work never starts; in-flight work gets its PR **parked, not merged**. Merges happen only for issues still in the approved cycle at merge time.
 4. **→ In Progress → In Review → Done** — the build loop pulls **the approved cycle's Ready issues** only and runs them, with the review gate inside. The blind test-author (ALI-105) runs **before** the PR opens — between the builder and the reviewer, inside `In Progress`, never after. `In Review` means the PR is open and awaiting the reviewer (which executes the blind test-author's tests as part of its own pass) and, on risk-labelled issues, the security pass.
 
@@ -69,6 +69,18 @@ Keeping these distinct is what keeps the escalation queue worth reading. Parked 
 **"Ready" means "won't stall."** The mid-sprint pause is an *unreadiness* symptom — cured by gating readiness upstream, not by hoping the build doesn't stall.
 
 **No issue ever ends a run in "In Progress".** After any run, every issue it touched is in exactly one of: `In Review` (PR open), `Parked` (artifact preserved), or `Needs Pedro` (decision required) — plus those never admitted, which stay `Ready` with a logged deferral reason. "In Progress with nothing behind it" is the state that rots silently, so it is asserted against rather than merely discouraged.
+
+### Two release tracks — engine vs product increments (ALI-170)
+
+A cycle closing "N of N" measures merged PRs, not delivered capability — story points measure effort, and nothing about a point total says whether a real person can now do something they could not do before. There are two different kinds of increment, and conflating them into one number is what makes that question unanswerable:
+
+| | Engine (Development Engine Seed) | Product (Booking platform, Customer sites) |
+|---|---|---|
+| Increment is | internal — the engine gets better at building | external — a user can do something new |
+| Released to | the crew | a real person |
+| "Done" means | merged, gated, measured | a human completed a task they could not complete before |
+
+**Both are legitimate.** Engine cycles routinely ship zero user-visible capability for weeks — expected, not a failure. What is not fine is a board reader being unable to tell which kind of cycle just happened. The planner's cycle-proposal step (`planner.md`, "Cycle nomination and composition") carries the one line that answers it: a named capability, or an explicit "no user-visible release" plus what the cycle bought instead. A count of merged PRs, a story-point total, or an "N of N" is **never** presented as that answer — see the invariant on ALI-170.
 
 ---
 
@@ -156,6 +168,8 @@ Each metric maps to one knob: bounces → model tier or spec strictness; escalat
 - The cadence limiter is **Pedro** (define + approve), not the agents — which is why 1–3 day cycles fit.
 - Forecast to a **frozen cut line** (a product's "first-wave" issue set), not "done."
 - **weeks-to-first-wave ≈ (remaining MVP points ÷ velocity) × cycle length.** The first BA pass — pointing the backlog — supplies the numerator.
+
+**Context-capacity rule for releases (ALI-170).** Capacity here is context, not points. Gate 9a (§20) states the rule for a single Ready item, and that wording is cited here rather than restated: *"A Ready item must fit inside one agent's context window: the work itself, plus the briefing required to do it. Parallelism buys throughput across items, never depth within one — ten agents is ten separate windows, not one large one."* The same rule governs a **release**, one level up: the planning test is not "does it fit the points budget," it is "does it decompose into items that each fit one agent's window" — yes → it can ship this cycle; no → make the release smaller, because adding agents changes nothing. Decomposition itself is not free — each agent needs enough shared picture to do its part, and that briefing is paid out of the same context budget as the work. A release that does not fit is **recorded as not fitting, never shipped half**: a failed release is a permitted, expected outcome, and the retro then asks whether it was under-decomposed or genuinely too large for the cycle.
 
 ### The calibration loop (ALI-106) — a story point is a measured unit, not a guess
 
