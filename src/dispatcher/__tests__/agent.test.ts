@@ -34,7 +34,7 @@
  * falsification treatment ALI-161's S1 regression guard gets.
  */
 
-import { existsSync, mkdirSync, promises as fs, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, promises as fs, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -42,18 +42,23 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   BLIND_QA_DEFINITION,
   BLIND_QA_MANIFEST_FILENAME,
+  BLIND_QA_PERMISSION_MODE,
   BLIND_QA_RESULT_SENTINEL,
   BLIND_QA_TIER,
+  BLIND_QA_TOOL_UNIVERSE,
   BLIND_TESTS_DIR_SEGMENTS,
   BUILD_SEATS,
   BlindQaArtifactError,
   BlindQaInvalidContextError,
   BlindQaNotConfiguredError,
   BlindQaOutputParseError,
+  BlindQaToolPolicyError,
   DEFAULT_SEAT_TIMEOUT_MS,
+  MCP_TOOL_WILDCARD,
   EngineDefinitionUnreadableError,
   PINNED_MODEL_IDS,
   PINNED_SETTING_SOURCES,
+  READ_CAPABLE_TOOLS,
   SEAT_ENV_ALLOWLIST,
   SEAT_RESULT_SENTINEL,
   SeatDispatchTimeoutError,
@@ -61,12 +66,18 @@ import {
   SeatProcessFailedError,
   TIER_MODEL_IDS,
   UnknownSeatError,
+  blindQaCapabilityIsPinned,
   blindTestsRelativeDir,
   buildSeatEnv,
+  buildSeatToolPolicyArgs,
   createClaudeCliAgentPort,
+  copyVerifiedFile,
   createNodeProcessRunner,
+  disallowedToolsFrom,
   isBuildSeat,
   modelArgFrom,
+  parseSeatToolAllowlist,
+  permissionModeArgFrom,
   parseBlindQaResult,
   parseSeatResult,
   resultIsSecretFree,
@@ -240,16 +251,32 @@ interface QuarantinedString {
   value: string;
 }
 
+/** How a fake is armed for the blind seat: what it must refuse, and what it must insist on. */
+interface BlindFakePolicy {
+  quarantine: readonly QuarantinedString[];
+  /**
+   * Refuse a blind invocation that does not pin the child's capability
+   * (bounce round 1, S1). Off for the build seats, whose tool set is
+   * deliberately the full one.
+   */
+  requireCapabilityPin: boolean;
+}
+
 function validateBlindQuarantine(spec: ProcessSpec, quarantine: readonly QuarantinedString[]): string | null {
   for (const { label, value } of quarantine) {
     if (value === "") continue;
-    const channel =
-      spec.cwd.includes(value)
-        ? "working directory"
-        : spec.args.some((arg) => arg.includes(value))
-          ? "argv"
-          : spec.stdin.includes(value)
-            ? "prompt"
+    // All four channels the invariant names. `env` was missing in round 1 —
+    // the fake covered three of four, so the teeth did not match the claim
+    // (security S5, reviewer finding 4). Checked by *value*, since an
+    // allowlisted name carrying a worktree path is the shape that would leak.
+    const channel = spec.cwd.includes(value)
+      ? "working directory"
+      : spec.args.some((arg) => arg.includes(value))
+        ? "argv"
+        : spec.stdin.includes(value)
+          ? "prompt"
+          : Object.values(spec.env).some((entry) => entry.includes(value))
+            ? "environment"
             : null;
     if (channel !== null) {
       return (
@@ -261,9 +288,23 @@ function validateBlindQuarantine(spec: ProcessSpec, quarantine: readonly Quarant
   return null;
 }
 
-function validateInvocation(spec: ProcessSpec, quarantine: readonly QuarantinedString[] = []): string | null {
-  const leaked = validateBlindQuarantine(spec, quarantine);
+function validateInvocation(spec: ProcessSpec, policy?: BlindFakePolicy): string | null {
+  const leaked = validateBlindQuarantine(spec, policy?.quarantine ?? []);
   if (leaked !== null) return leaked;
+
+  // Bounce round 1, S1, as a hard rejection. Probed on `claude` 2.1.233: with
+  // no --disallowed-tools the child holds Read and Bash and reads a cwd canary
+  // with no prompt, and with no --permission-mode its Write is DENIED — so an
+  // invocation missing either flag is one that either un-blinds the seat or
+  // cannot produce an artifact at all. Like the setting-sources rule above,
+  // this is stricter than the real CLI (which accepts it happily) and that is
+  // the point: the engine's invariant, expressed where a test can go red.
+  if (policy?.requireCapabilityPin === true && !blindQaCapabilityIsPinned(spec.args)) {
+    return (
+      "error: refusing a blind-seat invocation that does not pin the child's capability: expected " +
+      `--permission-mode ${BLIND_QA_PERMISSION_MODE} and --disallowed-tools covering ${READ_CAPABLE_TOOLS.join(", ")}`
+    );
+  }
 
   if (spec.command.trim() === "") return "error: no executable given";
   if (!spec.args.includes("--print")) {
@@ -321,7 +362,7 @@ function validateInvocation(spec: ProcessSpec, quarantine: readonly QuarantinedS
   return null;
 }
 
-function createFakeClaudeCli(script?: CliScript, quarantine: readonly QuarantinedString[] = []): FakeCli {
+function createFakeClaudeCli(script?: CliScript, policy?: BlindFakePolicy): FakeCli {
   const invocations: CliInvocation[] = [];
   const rejections: string[] = [];
   const fake: FakeCli = {
@@ -330,7 +371,7 @@ function createFakeClaudeCli(script?: CliScript, quarantine: readonly Quarantine
     killCount: 0,
     runner: {
       spawn(spec: ProcessSpec): ProcessHandle {
-        const rejection = validateInvocation(spec, quarantine);
+        const rejection = validateInvocation(spec, policy);
         if (rejection !== null) {
           rejections.push(rejection);
           // Faithful shape: the real CLI starts, refuses, and exits non-zero.
@@ -905,14 +946,23 @@ describe("AC6: the per-dispatch timeout kills the child and throws", () => {
     expect(fake.killCount).toBe(1);
   });
 
-  it("does not kill a seat that finishes inside the limit", async () => {
+  it("reaps the seat's process group exactly once on the success path too (ALI-162 S2)", async () => {
     const { enginePath, worktreePath } = await makeTrees();
     const fake = createFakeClaudeCli();
     const port = makePort(fake, { timeoutMs: 5_000 });
 
-    await port.dispatch("builder", makeCtx({ enginePath, worktreePath }));
+    const result = await port.dispatch("builder", makeCtx({ enginePath, worktreePath }));
 
-    expect(fake.killCount).toBe(0);
+    // This assertion was `killCount === 0` when ALI-161 shipped, on the reading
+    // that a seat which finished needs no killing. ALI-162's security pass
+    // showed the gap that leaves: `kill()` here is a process-GROUP signal, and
+    // on the success path the seat itself has already exited — so what it
+    // reaps is whatever the seat left running. Round 1 reaped only on timeout,
+    // and a surviving grandchild raced the artifact copy (proved exploitable),
+    // just as it could keep writing to a worktree the run has already parked.
+    // The seat still completed normally; the group is simply not left behind.
+    expect(result.summary).toContain("ok");
+    expect(fake.killCount).toBe(1);
   });
 
   it("refuses to be constructed with a non-positive or non-finite limit", () => {
@@ -1172,8 +1222,8 @@ interface BlindWorld {
   artifactRoot: string;
   stagingRoot: string;
   blindQa: BlindQaSeatConfig;
-  /** What the fake refuses to let through (criterion 6). */
-  quarantine: QuarantinedString[];
+  /** What the fake refuses to let through, and what it insists on (criterion 6 + S1). */
+  fakePolicy: BlindFakePolicy;
   /** `<artifactRoot>/.engine/blind-tests/<ISSUE-ID>` — absolute. */
   artifactDir: string;
 }
@@ -1215,11 +1265,14 @@ async function makeBlindWorld(issueId: string = BLIND_ISSUE_ID): Promise<BlindWo
     artifactRoot,
     stagingRoot,
     blindQa: { enginePath, artifactRoot, stagingRoot },
-    quarantine: [
-      { label: "worktree path", value: worktreePath },
-      { label: "branch name", value: BLIND_BRANCH },
-      { label: "diff text", value: BLIND_DIFF_TEXT },
-    ],
+    fakePolicy: {
+      quarantine: [
+        { label: "worktree path", value: worktreePath },
+        { label: "branch name", value: BLIND_BRANCH },
+        { label: "diff text", value: BLIND_DIFF_TEXT },
+      ],
+      requireCapabilityPin: true,
+    },
     artifactDir: join(artifactRoot, blindTestsRelativeDir(issueId)),
   };
 }
@@ -1324,7 +1377,7 @@ async function thrownBy(attempt: () => Promise<unknown>): Promise<Error> {
 describe("ALI-162 criterion 1: explicit model pin, and qa.md read from the run's pinned engine tree", () => {
   it("passes an explicit --model for the roster's blind-QA tier", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     await port.dispatchBlindQa(makeBlindCtx(world));
@@ -1352,7 +1405,7 @@ describe("ALI-162 criterion 1: explicit model pin, and qa.md read from the run's
 
   it("supplies the PINNED qa.md as the governing system prompt when a worktree holds a rewritten copy", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     await port.dispatchBlindQa(makeBlindCtx(world));
@@ -1365,7 +1418,7 @@ describe("ALI-162 criterion 1: explicit model pin, and qa.md read from the run's
 
   it("suppresses cwd-rooted .claude/** discovery and passes no --agent (ALI-161's S1 mechanism)", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     await port.dispatchBlindQa(makeBlindCtx(world));
@@ -1380,7 +1433,7 @@ describe("ALI-162 criterion 1: explicit model pin, and qa.md read from the run's
   it("throws rather than falling back when the pinned tree has no qa.md", async () => {
     const world = await makeBlindWorld();
     await fs.rm(join(world.enginePath, seatDefinitionRelativePath(BLIND_QA_DEFINITION)));
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     const error = await thrownBy(() => port.dispatchBlindQa(makeBlindCtx(world)));
@@ -1394,7 +1447,7 @@ describe("ALI-162 criterion 1: explicit model pin, and qa.md read from the run's
 
   it("does not disclose the pinned tree's path, or any other path, to the child (S3)", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     await port.dispatchBlindQa(makeBlindCtx(world));
@@ -1411,6 +1464,158 @@ describe("ALI-162 criterion 1: explicit model pin, and qa.md read from the run's
 });
 
 // ---------------------------------------------------------------------------
+// Criterion 1, second half (bounce round 1, S1) — the seat's CAPABILITY is
+// pinned on the argv, derived from the pinned qa.md's own `tools:` key.
+//
+// Round 1 asserted blindness and shipped an argv that, probed against `claude`
+// 2.1.233, gave the seat `Read` and `Bash` (it read a cwd canary with no
+// prompt) and no working `Write`. `tools:` is agent-definition frontmatter and
+// this adapter passes no `--agent`, so the key was inert prose. These tests
+// assert the flags that were probe-proved to actually change the child.
+// ---------------------------------------------------------------------------
+
+describe("ALI-162 S1: the blind seat's capability is pinned on the argv, not merely described in qa.md", () => {
+  it("denies every read-capable tool, and MCP tools by wildcard", async () => {
+    const world = await makeBlindWorld();
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
+    const port = makePort(fake, { blindQa: world.blindQa });
+
+    await port.dispatchBlindQa(makeBlindCtx(world));
+
+    const { args } = fake.invocations[0];
+    const denied = disallowedToolsFrom(args);
+    // Probed: without these the child holds Read and Bash. `CWD_READ=ZZCANARYZZ`
+    // became `CWD_READ=NOREAD` once they were on the argv.
+    for (const tool of READ_CAPABLE_TOOLS) expect(denied).toContain(tool);
+    expect(denied).toContain(MCP_TOOL_WILDCARD);
+    expect(denied).not.toContain("Write");
+    expect(blindQaCapabilityIsPinned(args)).toBe(true);
+  });
+
+  it("pins the permission mode that lets Write work in cwd without granting writes outside it", async () => {
+    const world = await makeBlindWorld();
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
+    const port = makePort(fake, { blindQa: world.blindQa });
+
+    await port.dispatchBlindQa(makeBlindCtx(world));
+
+    // Probed on disk, not from the child's own report: `acceptEdits` gives
+    // inCwd=true / relOutside=false / absOutside=false, while the lookalike
+    // `--allowedTools Write` gives relOutside=TRUE and absOutside=TRUE — it
+    // would have handed the blind seat write access to every worktree.
+    expect(permissionModeArgFrom(fake.invocations[0].args)).toBe(BLIND_QA_PERMISSION_MODE);
+    expect(fake.invocations[0].args).not.toContain("--allowedTools");
+    expect(BLIND_QA_PERMISSION_MODE).not.toBe("bypassPermissions");
+  });
+
+  it("derives the deny list from the definition, so editing `tools:` changes what the child can do", async () => {
+    const world = await makeBlindWorld();
+    // A definition that also allows Glob — not what the engine ships, but the
+    // point is that the pin FOLLOWS the pinned file rather than a constant.
+    await fs.writeFile(
+      join(world.enginePath, seatDefinitionRelativePath(BLIND_QA_DEFINITION)),
+      `---\nname: qa\nmodel: ${BLIND_QA_TIER}\ntools: Write, Glob\n---\n\n${QA_ENGINE_MARKER}\n`,
+      "utf8",
+    );
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), {
+      ...world.fakePolicy,
+      // This invocation is deliberately NOT fully blind, so the fake's pin rule
+      // would refuse it — the rule is asserted on its own below.
+      requireCapabilityPin: false,
+    });
+    const port = makePort(fake, { blindQa: world.blindQa });
+
+    await port.dispatchBlindQa(makeBlindCtx(world));
+
+    const denied = disallowedToolsFrom(fake.invocations[0].args);
+    expect(denied).not.toContain("Glob");
+    expect(denied).toContain("Read");
+    // …and the engine's real qa.md names only Write, which is why the shipped
+    // pin is total.
+    expect(parseSeatToolAllowlist(await fs.readFile(join(process.cwd(), seatDefinitionRelativePath(BLIND_QA_DEFINITION)), "utf8"))).toEqual([
+      "Write",
+    ]);
+  });
+
+  it("fails closed when the pinned definition has no `tools:` key at all", async () => {
+    const world = await makeBlindWorld();
+    await fs.writeFile(
+      join(world.enginePath, seatDefinitionRelativePath(BLIND_QA_DEFINITION)),
+      `---\nname: qa\nmodel: ${BLIND_QA_TIER}\n---\n\n${QA_ENGINE_MARKER}\n`,
+      "utf8",
+    );
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
+    const port = makePort(fake, { blindQa: world.blindQa });
+
+    const error = await thrownBy(() => port.dispatchBlindQa(makeBlindCtx(world)));
+
+    // The config half is load-bearing now: delete it and no dispatch happens,
+    // rather than a dispatch with the CLI's ambient tool set.
+    expect(error).toBeInstanceOf(BlindQaToolPolicyError);
+    expect(fake.invocations).toEqual([]);
+  });
+
+  it("refuses a `tools:` key naming something it cannot pin", () => {
+    // The CLI answers an unrecognised deny-rule subject with
+    // `matches no known tool` and carries on — so an unknown name here would be
+    // a capability nobody is actually restricting. Observed for `MultiEdit` and
+    // `SlashCommand`, which is why neither is in the universe table.
+    expect(() => parseSeatToolAllowlist("---\nname: qa\ntools: Write, Telepathy\n---\n")).toThrow(
+      BlindQaToolPolicyError,
+    );
+    expect(() => parseSeatToolAllowlist("---\nname: qa\ntools:\n---\n")).toThrow(/names no tool/);
+    expect(() => parseSeatToolAllowlist("no frontmatter here")).toThrow(/frontmatter/);
+    expect(BLIND_QA_TOOL_UNIVERSE).not.toContain("MultiEdit");
+    expect(BLIND_QA_TOOL_UNIVERSE).toContain("Read");
+  });
+
+  it("the fake goes RED if the capability pin is ever dropped (S1 regression guard)", async () => {
+    const world = await makeBlindWorld();
+    const fake = createFakeClaudeCli(undefined, world.fakePolicy);
+
+    // Round 1's exact blind argv, replayed by hand: model, setting sources and
+    // system prompt all correct — and no capability pin, which is precisely the
+    // invocation that probed as holding Read and Bash.
+    const handle = fake.runner.spawn({
+      command: "claude",
+      args: ["--print", "--model", TIER_MODEL_IDS.sonnet, "--setting-sources", "user", "--system-prompt", "qa"],
+      cwd: world.stagingRoot,
+      env: {},
+      stdin: "criteria",
+    });
+    const outcome = await handle.exited;
+
+    expect(outcome.exitCode).not.toBe(0);
+    expect(outcome.stderr).toMatch(/does not pin the child's capability/);
+    expect(fake.invocations).toEqual([]);
+    expect(fake.rejections).toHaveLength(1);
+  });
+
+  it("treats a deny list that lost `Read` as unpinned, not as good enough", () => {
+    const full = buildSeatToolPolicyArgs(["Write"]);
+    expect(blindQaCapabilityIsPinned(full)).toBe(true);
+
+    // The failure this predicate exists to catch: the flag is still there, the
+    // list is still long, and the one tool that decides blindness is missing.
+    const holed = full.filter((arg) => arg !== "Read");
+    expect(blindQaCapabilityIsPinned(holed)).toBe(false);
+    // And a pin with no permission mode cannot write its artifact at all.
+    expect(blindQaCapabilityIsPinned(full.filter((arg) => arg !== BLIND_QA_PERMISSION_MODE))).toBe(false);
+  });
+
+  it("leaves the build seats' tool set alone — they have to build", async () => {
+    const { enginePath, worktreePath } = await makeTrees();
+    const fake = createFakeClaudeCli();
+    const port = makePort(fake);
+
+    await port.dispatch("builder", makeCtx({ enginePath, worktreePath }));
+
+    expect(disallowedToolsFrom(fake.invocations[0].args)).toEqual([]);
+    expect(permissionModeArgFrom(fake.invocations[0].args)).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Criterion 2 (teeth, `critical` #1) — the process cannot see the implementation
 // ---------------------------------------------------------------------------
 
@@ -1421,7 +1626,7 @@ describe("ALI-162 criterion 2 (teeth): the blind seat's process cannot see the i
     // path/branch/diff are in the issue body's `## Why`/`## What`.
     expect(existsSync(join(world.worktreePath, "agent.diff"))).toBe(true);
 
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake, {
       blindQa: world.blindQa,
       envSource: {
@@ -1437,10 +1642,10 @@ describe("ALI-162 criterion 2 (teeth): the blind seat's process cannot see the i
     await port.dispatchBlindQa(makeBlindCtx(world));
 
     const invocation = fake.invocations[0];
-    const everything = [invocation.cwd, invocation.args.join(" "), invocation.stdin, ...Object.values(invocation.env)].join(
-      " ",
+    const everything = [invocation.cwd, invocation.args.join("\0"), invocation.stdin, ...Object.values(invocation.env)].join(
+      "\0",
     );
-    for (const { value } of world.quarantine) {
+    for (const { value } of world.fakePolicy.quarantine) {
       expect(everything).not.toContain(value);
     }
     // And the fake — armed to refuse any of those — accepted this invocation.
@@ -1449,7 +1654,7 @@ describe("ALI-162 criterion 2 (teeth): the blind seat's process cannot see the i
 
   it("runs with a cwd that is NOT any worktree, and not the engine checkout either", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     await port.dispatchBlindQa(makeBlindCtx(world));
@@ -1469,7 +1674,7 @@ describe("ALI-162 criterion 2 (teeth): the blind seat's process cannot see the i
 
   it("carries the five blind fields and nothing else from the issue", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
     const ctx = makeBlindCtx(world);
 
@@ -1492,7 +1697,7 @@ describe("ALI-162 criterion 2 (teeth): the blind seat's process cannot see the i
 
   it("wipes the staging directory afterwards, so nothing outlives the dispatch", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     await port.dispatchBlindQa(makeBlindCtx(world));
@@ -1509,7 +1714,7 @@ describe("ALI-162 criterion 2 (teeth): the blind seat's process cannot see the i
 describe("ALI-162 criterion 3: writes land only under .engine/blind-tests/<ISSUE-ID>/", () => {
   it("publishes exactly the paths written, as engine-root-relative paths", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     const result = await port.dispatchBlindQa(makeBlindCtx(world));
@@ -1542,7 +1747,7 @@ describe("ALI-162 criterion 3: writes land only under .engine/blind-tests/<ISSUE
       testFilesWritten: [...CONFORMING_ENVELOPE.testFilesWritten, join("cases", "invariant.test.ts")],
       untestableCriteria: [],
     };
-    const fake = createFakeClaudeCli(blindSeat(files, envelope), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(files, envelope), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     const result = await port.dispatchBlindQa(makeBlindCtx(world));
@@ -1578,7 +1783,7 @@ describe("ALI-162 criterion 3: writes land only under .engine/blind-tests/<ISSUE
           testFilesWritten: [...CONFORMING_ENVELOPE.testFilesWritten, escape],
           untestableCriteria: [],
         }),
-        world.quarantine,
+        world.fakePolicy,
       );
       const port = makePort(fake, { blindQa: world.blindQa });
 
@@ -1592,6 +1797,148 @@ describe("ALI-162 criterion 3: writes land only under .engine/blind-tests/<ISSUE
       expect(existsSync(fake.invocations[0].cwd)).toBe(false);
     });
   }
+
+  // The publication step, tested directly and deterministically.
+  //
+  // A first draft of this block raced a `setTimeout` swap against the copy and
+  // passed either way — so reverting the fix left it GREEN, the same
+  // pass-for-the-wrong-reason class the confinement rows hit. What the fix
+  // actually promises is a property of the copy itself: bytes are read from a
+  // descriptor opened `O_NOFOLLOW`, so no link substituted at any moment can
+  // redirect them.
+  describe("the copy step never follows a link (S2)", () => {
+    it("copies a regular file's bytes", async () => {
+      const world = await makeBlindWorld();
+      const source = join(world.stagingRoot, "real.test.ts");
+      const destination = join(world.stagingRoot, "published.test.ts");
+      await fs.writeFile(source, "// honest bytes\n", "utf8");
+
+      await copyVerifiedFile(source, destination, "real.test.ts");
+
+      expect(await fs.readFile(destination, "utf8")).toBe("// honest bytes\n");
+    });
+
+    it("refuses a source that is a symlink, whatever the walk saw earlier", async () => {
+      const world = await makeBlindWorld();
+      const secret = join(world.stagingRoot, "implementation-secret.txt");
+      await fs.writeFile(secret, "IMPLEMENTATION-SECRET-OUTSIDE-STAGING\n", "utf8");
+      const source = join(world.stagingRoot, "ac-1.test.ts");
+      symlinkSync(secret, source);
+      const destination = join(world.stagingRoot, "published.test.ts");
+
+      const error = await thrownBy(() => copyVerifiedFile(source, destination, "ac-1.test.ts"));
+
+      // This is the swap the security pass performed after the child exited:
+      // round 1's `copyFile` followed it and published the target's bytes as a
+      // blind test file, reported in `testFilesWritten` as legitimate.
+      expect(error).toBeInstanceOf(BlindQaArtifactError);
+      expect(error.message).toMatch(/symlink/);
+      expect(existsSync(destination)).toBe(false);
+    });
+
+    it("refuses to write through anything already sitting at the destination", async () => {
+      const world = await makeBlindWorld();
+      const source = join(world.stagingRoot, "real.test.ts");
+      await fs.writeFile(source, "// honest bytes\n", "utf8");
+      const secret = join(world.stagingRoot, "target.txt");
+      await fs.writeFile(secret, "PRE-EXISTING\n", "utf8");
+      const destination = join(world.stagingRoot, "published.test.ts");
+      symlinkSync(secret, destination);
+
+      // O_CREAT|O_EXCL: a link planted at the destination is a failure, not a
+      // silently followed write into whatever it points at.
+      await expect(copyVerifiedFile(source, destination, "real.test.ts")).rejects.toBeTruthy();
+      expect(await fs.readFile(secret, "utf8")).toBe("PRE-EXISTING\n");
+    });
+  });
+
+  it("refuses an artifact tampered with after the child exited, publishing nothing (S2)", async () => {
+    const world = await makeBlindWorld();
+    const outside = join(world.stagingRoot, "implementation-secret.txt");
+    await fs.writeFile(outside, "IMPLEMENTATION-SECRET-OUTSIDE-STAGING\n", "utf8");
+
+    // The security pass's scenario end to end, made deterministic: the swap is
+    // chained onto the very promise the adapter awaits, so it always lands
+    // after the child has "exited" and before the dispatch inspects anything —
+    // exactly the position a surviving grandchild occupies.
+    const runner: ProcessRunner = {
+      spawn(spec) {
+        writeStaged(spec.cwd, CONFORMING_FILES);
+        const swapped = join(spec.cwd, "ac-1.test.ts");
+        const exited = Promise.resolve({
+          exitCode: 0,
+          stdout: `${BLIND_QA_RESULT_SENTINEL} ${JSON.stringify(CONFORMING_ENVELOPE)}\n`,
+          stderr: "",
+        }).then((result) => {
+          rmSync(swapped);
+          symlinkSync(outside, swapped);
+          return result;
+        });
+        return { exited, kill() {} };
+      },
+    };
+    const port = createClaudeCliAgentPort({ runner, timeoutMs: 5_000, envSource: {}, blindQa: world.blindQa });
+
+    const error = await thrownBy(() => port.dispatchBlindQa(makeBlindCtx(world)));
+
+    expect(error).toBeInstanceOf(BlindQaArtifactError);
+    expect(error.message).toMatch(/symlink/);
+    // Round 1 RESOLVED here, having published the target's bytes.
+    expect(existsSync(world.artifactDir)).toBe(false);
+    expect(await fs.readFile(outside, "utf8")).toContain("IMPLEMENTATION-SECRET");
+  });
+
+  it("reaps the seat's process group on the success path, so nothing survives to race the copy (S2)", async () => {
+    const world = await makeBlindWorld();
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
+    const port = makePort(fake, { blindQa: world.blindQa });
+
+    await port.dispatchBlindQa(makeBlindCtx(world));
+
+    // Round 1 reaped only on the timeout path, so a *successful* dispatch could
+    // return while a grandchild of the seat was still running — which is what
+    // made the swap above reachable at all.
+    expect(fake.killCount).toBe(1);
+  });
+
+  it("clears the destination before publishing, so a re-dispatch leaves no stale test files (S3)", async () => {
+    const world = await makeBlindWorld();
+    const first = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
+    await makePort(first, { blindQa: world.blindQa }).dispatchBlindQa(makeBlindCtx(world));
+    expect(await listFiles(world.artifactDir)).toHaveLength(3);
+
+    // The bounce case: the same issue dispatched again, this time producing
+    // fewer files. Round 1 only ever added, so `ac-2.test.ts` survived —
+    // undeclared, absent from testFilesWritten, and run by the reviewer as if
+    // it belonged to this run.
+    const second = createFakeClaudeCli(
+      blindSeat(
+        { [BLIND_QA_MANIFEST_FILENAME]: MANIFEST_CONTENT, "ac-1.test.ts": "// rewritten\n" },
+        { testFilesWritten: [BLIND_QA_MANIFEST_FILENAME, "ac-1.test.ts"], untestableCriteria: [2] },
+      ),
+      world.fakePolicy,
+    );
+    const result = await makePort(second, { blindQa: world.blindQa }).dispatchBlindQa(makeBlindCtx(world));
+
+    expect(await listFiles(world.artifactDir)).toEqual(["ac-1.test.ts", BLIND_QA_MANIFEST_FILENAME]);
+    expect(result.testFilesWritten).toHaveLength(2);
+    expect(await fs.readFile(join(world.artifactDir, "ac-1.test.ts"), "utf8")).toBe("// rewritten\n");
+  });
+
+  it("records an all-untestable run instead of failing it (S6)", async () => {
+    const world = await makeBlindWorld();
+    // Every criterion untestable, so there is nothing to write. Round 1's
+    // unconditional manifest rule turned that honest outcome into a dispatch
+    // failure, which is how ALI-105's AC8 numbers got lost from the run log.
+    const fake = createFakeClaudeCli(blindSeat({}, { testFilesWritten: [], untestableCriteria: [1, 2, 3] }), world.fakePolicy);
+    const port = makePort(fake, { blindQa: world.blindQa });
+
+    const result = await port.dispatchBlindQa(makeBlindCtx(world));
+
+    expect(result).toEqual({ testFilesWritten: [], untestableCriteria: [1, 2, 3] });
+    // A manifest is still required the moment anything IS written.
+    expect(existsSync(world.artifactDir)).toBe(false);
+  });
 
   it("bounds an UNDECLARED escape to the throwaway staging root — never the engine checkout or a worktree", async () => {
     const world = await makeBlindWorld();
@@ -1607,16 +1954,18 @@ describe("ALI-162 criterion 3: writes land only under .engine/blind-tests/<ISSUE
       return {
         stdout: `${BLIND_QA_RESULT_SENTINEL} ${JSON.stringify(CONFORMING_ENVELOPE)}\n`,
       };
-    }, world.quarantine);
+    }, world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     const result = await port.dispatchBlindQa(makeBlindCtx(world));
 
     // The declared artifact published normally…
     expect(result.testFilesWritten).toHaveLength(3);
-    // …the escape landed in the throwaway staging root, which the dispatch
-    // does not treat as an artifact…
-    expect(await listFiles(world.stagingRoot)).toEqual(["escaped.test.ts"]);
+    // …the escape was cleaned with the staging container (S7). Round 1 removed
+    // only cwd, so a one-level escape survived in the temp root forever, one
+    // file per escaping dispatch; cwd now sits one level inside a container
+    // that is what actually gets removed.
+    expect(await listFiles(world.stagingRoot)).toEqual([]);
     // …and neither the engine checkout's artifact directory nor the worktree
     // gained anything from it.
     expect(await listFiles(world.artifactDir)).toEqual([
@@ -1633,7 +1982,7 @@ describe("ALI-162 criterion 3: writes land only under .engine/blind-tests/<ISSUE
     const fake = createFakeClaudeCli(
       // Writes a fourth file, declares three.
       blindSeat({ ...CONFORMING_FILES, "undeclared.test.ts": "// sneaky\n" }, CONFORMING_ENVELOPE),
-      world.quarantine,
+      world.fakePolicy,
     );
     const port = makePort(fake, { blindQa: world.blindQa });
 
@@ -1652,7 +2001,7 @@ describe("ALI-162 criterion 3: writes land only under .engine/blind-tests/<ISSUE
         testFilesWritten: [...CONFORMING_ENVELOPE.testFilesWritten, "ac-4.test.ts"],
         untestableCriteria: [],
       }),
-      world.quarantine,
+      world.fakePolicy,
     );
     const port = makePort(fake, { blindQa: world.blindQa });
 
@@ -1675,7 +2024,7 @@ describe("ALI-162 criterion 3: writes land only under .engine/blind-tests/<ISSUE
           untestableCriteria: [],
         })}\n`,
       };
-    }, world.quarantine);
+    }, world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     const error = await thrownBy(() => port.dispatchBlindQa(makeBlindCtx(world)));
@@ -1689,7 +2038,7 @@ describe("ALI-162 criterion 3: writes land only under .engine/blind-tests/<ISSUE
     const world = await makeBlindWorld();
     const fake = createFakeClaudeCli(
       blindSeat({ "ac-1.test.ts": "// criterion 1\n" }, { testFilesWritten: ["ac-1.test.ts"], untestableCriteria: [] }),
-      world.quarantine,
+      world.fakePolicy,
     );
     const port = makePort(fake, { blindQa: world.blindQa });
 
@@ -1699,9 +2048,61 @@ describe("ALI-162 criterion 3: writes land only under .engine/blind-tests/<ISSUE
     expect(error.message).toContain(BLIND_QA_MANIFEST_FILENAME);
   });
 
+  it("rejects a declared path that would nest another issue's directory inside this one (reviewer finding)", async () => {
+    const world = await makeBlindWorld();
+    // Syntactically clean, confined to staging, and accompanied by a valid
+    // manifest — so neither the traversal guard nor the manifest rule is what
+    // decides this one. Round 1 silently published it as
+    // `.engine/blind-tests/ALI-162/.engine/blind-tests/ALI-999/leak.test.ts`,
+    // where a reviewer cannot tell whose test it is. Decided explicitly: the
+    // runtime owns that prefix, so a declared copy of it is refused.
+    const nested = join(...BLIND_TESTS_DIR_SEGMENTS, "ALI-999", "leak.test.ts");
+    const fake = createFakeClaudeCli(
+      blindSeat(
+        { ...CONFORMING_FILES, [nested]: "// belongs to another issue\n" },
+        { testFilesWritten: [...CONFORMING_ENVELOPE.testFilesWritten, nested], untestableCriteria: [] },
+      ),
+      world.fakePolicy,
+    );
+    const port = makePort(fake, { blindQa: world.blindQa });
+
+    const error = await thrownBy(() => port.dispatchBlindQa(makeBlindCtx(world)));
+
+    expect(error).toBeInstanceOf(BlindQaArtifactError);
+    expect(error.message).toMatch(/carries the .*blind-tests\/? prefix|nest one issue's artifact/);
+    expect(existsSync(world.artifactDir)).toBe(false);
+    // And nothing landed in the other issue's directory either.
+    expect(existsSync(join(world.artifactRoot, blindTestsRelativeDir("ALI-999")))).toBe(false);
+  });
+
+  it("rejects an escape for CONFINEMENT even when the artifact is otherwise perfect (reviewer finding)", async () => {
+    const world = await makeBlindWorld();
+    // The reviewer's point: a negative test that passes because the manifest is
+    // missing proves nothing about confinement. Here the manifest is present,
+    // both declared files exist, the envelope is well-formed — the ONLY defect
+    // is that one declared path leaves the directory, and the rejection must
+    // name that.
+    const escape = join("..", "..", "engine-checkout", "hijacked.test.ts");
+    const fake = createFakeClaudeCli(
+      blindSeat(CONFORMING_FILES, {
+        testFilesWritten: [...CONFORMING_ENVELOPE.testFilesWritten, escape],
+        untestableCriteria: [],
+      }),
+      world.fakePolicy,
+    );
+    const port = makePort(fake, { blindQa: world.blindQa });
+
+    const error = await thrownBy(() => port.dispatchBlindQa(makeBlindCtx(world)));
+
+    expect(error).toBeInstanceOf(BlindQaArtifactError);
+    expect(error.message).toMatch(/escapes the artifact directory/);
+    expect(error.message).not.toMatch(/manifest/);
+    expect(existsSync(join(world.artifactRoot, "hijacked.test.ts"))).toBe(false);
+  });
+
   it("names an issue id that is not an identifier as a hard error, before any path is built", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
     const ctx = { ...makeBlindCtx(world), issueId: join("..", "..", ".claude", "agents") };
 
@@ -1716,7 +2117,7 @@ describe("ALI-162 criterion 3: writes land only under .engine/blind-tests/<ISSUE
 
   it("confines each issue to its own directory", async () => {
     const world = await makeBlindWorld("ALI-105");
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     const result = await port.dispatchBlindQa(makeBlindCtx(world, "ALI-105"));
@@ -1753,7 +2154,7 @@ describe("ALI-162 criterion 4: an unparseable blind result throws, and is never 
   for (const [label, stdout] of unparseable) {
     it(`throws BlindQaOutputParseError: ${label}`, async () => {
       const world = await makeBlindWorld();
-      const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, stdout), world.quarantine);
+      const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, stdout), world.fakePolicy);
       const port = makePort(fake, { blindQa: world.blindQa });
 
       const outcome = await port
@@ -1782,7 +2183,7 @@ describe("ALI-162 criterion 4: an unparseable blind result throws, and is never 
       })}`,
       "",
     ].join("\n");
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, prose), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, prose), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     const result = await port.dispatchBlindQa(makeBlindCtx(world));
@@ -1799,7 +2200,7 @@ describe("ALI-162 criterion 4: an unparseable blind result throws, and is never 
         model: "sonnet",
         effort: "standard",
       }),
-      world.quarantine,
+      world.fakePolicy,
     );
     const port = makePort(fake, { blindQa: world.blindQa });
 
@@ -1820,7 +2221,7 @@ describe("ALI-162 criterion 4: an unparseable blind result throws, and is never 
 
   it("never back-fills `model` from the tier it pinned (ALI-106 AC3)", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     const result = await port.dispatchBlindQa(makeBlindCtx(world));
@@ -1833,7 +2234,7 @@ describe("ALI-162 criterion 4: an unparseable blind result throws, and is never 
     const world = await makeBlindWorld();
     const fake = createFakeClaudeCli(
       blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE, { exitCode: 1, stderr: "panic: no write permission" }),
-      world.quarantine,
+      world.fakePolicy,
     );
     const port = makePort(fake, { blindQa: world.blindQa });
 
@@ -1852,7 +2253,7 @@ describe("ALI-162 criterion 4: an unparseable blind result throws, and is never 
     ];
 
     for (const stdout of leaky) {
-      const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, stdout), world.quarantine);
+      const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, stdout), world.fakePolicy);
       const port = makePort(fake, { blindQa: world.blindQa });
       const error = await thrownBy(() => port.dispatchBlindQa(makeBlindCtx(world)));
 
@@ -1862,7 +2263,7 @@ describe("ALI-162 criterion 4: an unparseable blind result throws, and is never 
 
     const failing = createFakeClaudeCli(
       blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE, { exitCode: 1, stderr: "denied for sk-LEAKED123456" }),
-      world.quarantine,
+      world.fakePolicy,
     );
     const error = await thrownBy(() =>
       makePort(failing, { blindQa: world.blindQa }).dispatchBlindQa(makeBlindCtx(world)),
@@ -1885,7 +2286,7 @@ describe("ALI-162 criterion 4: an unparseable blind result throws, and is never 
 describe("ALI-162 criterion 5: a hung blind seat is killed, not waited on", () => {
   it("rejects with SeatDispatchTimeoutError, kills the child, and cleans up staging", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(() => "hang", world.quarantine);
+    const fake = createFakeClaudeCli(() => "hang", world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa, timeoutMs: 40 });
 
     const startedAt = Date.now();
@@ -1904,14 +2305,17 @@ describe("ALI-162 criterion 5: a hung blind seat is killed, not waited on", () =
     expect(existsSync(world.artifactDir)).toBe(false);
   });
 
-  it("does not kill a blind seat that finishes inside the limit", async () => {
+  it("lets a blind seat that finishes inside the limit complete, reaping its group once (S2)", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa, timeoutMs: 5_000 });
 
-    await port.dispatchBlindQa(makeBlindCtx(world));
+    const result = await port.dispatchBlindQa(makeBlindCtx(world));
 
-    expect(fake.killCount).toBe(0);
+    // Not killed *early* — the artifact is complete — and the group is reaped
+    // once, before anything reads the staging directory.
+    expect(result.testFilesWritten).toHaveLength(3);
+    expect(fake.killCount).toBe(1);
     expect(DEFAULT_SEAT_TIMEOUT_MS).toBeGreaterThan(0);
   });
 });
@@ -1935,7 +2339,7 @@ describe("ALI-162 criterion 6 (faithful fake): the runner fake rejects a leaking
 
   it("rejects a prompt that names the worktree", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(undefined, world.quarantine);
+    const fake = createFakeClaudeCli(undefined, world.fakePolicy);
 
     const handle = fake.runner.spawn(
       leakingSpec({ stdin: `criteria\n<workspace worktree="${world.worktreePath}" />` }),
@@ -1955,7 +2359,7 @@ describe("ALI-162 criterion 6 (faithful fake): the runner fake rejects a leaking
 
   it("rejects argv that carries the branch name", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(undefined, world.quarantine);
+    const fake = createFakeClaudeCli(undefined, world.fakePolicy);
 
     const handle = fake.runner.spawn(
       leakingSpec({
@@ -1969,7 +2373,7 @@ describe("ALI-162 criterion 6 (faithful fake): the runner fake rejects a leaking
 
   it("rejects cwd = the worktree — the build seats' cwd, wrong for this seat", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(undefined, world.quarantine);
+    const fake = createFakeClaudeCli(undefined, world.fakePolicy);
 
     const handle = fake.runner.spawn(leakingSpec({ cwd: world.worktreePath }));
 
@@ -1979,7 +2383,7 @@ describe("ALI-162 criterion 6 (faithful fake): the runner fake rejects a leaking
 
   it("rejects a prompt carrying the diff itself", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(undefined, world.quarantine);
+    const fake = createFakeClaudeCli(undefined, world.fakePolicy);
 
     const handle = fake.runner.spawn(leakingSpec({ stdin: `criteria\n${BLIND_DIFF_TEXT}` }));
 
@@ -2009,7 +2413,7 @@ describe("ALI-162 criterion 6 (faithful fake): the runner fake rejects a leaking
 
   it("still accepts the adapter's own invocation — the quarantine is not blanket refusal", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     const result = await port.dispatchBlindQa(makeBlindCtx(world));
@@ -2026,7 +2430,7 @@ describe("ALI-162 criterion 6 (faithful fake): the runner fake rejects a leaking
 describe("ALI-162: the blind seat fails closed when it is not properly wired", () => {
   it("throws BlindQaNotConfiguredError when the port has no pinned engine tree for it", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake); // no blindQa config
 
     const error = await thrownBy(() => port.dispatchBlindQa(makeBlindCtx(world)));
@@ -2043,10 +2447,10 @@ describe("ALI-162: the blind seat fails closed when it is not properly wired", (
     const fake = createFakeClaudeCli();
 
     for (const blindQa of [
-      { enginePath: "engine-pin" },
+      { enginePath: "engine-pin", artifactRoot: "/abs/checkout" },
       { enginePath: "/abs/engine", artifactRoot: "./checkout" },
-      { enginePath: "/abs/engine", stagingRoot: "tmp" },
-      { enginePath: "   " },
+      { enginePath: "/abs/engine", artifactRoot: "/abs/checkout", stagingRoot: "tmp" },
+      { enginePath: "   ", artifactRoot: "/abs/checkout" },
     ]) {
       expect(() => createClaudeCliAgentPort({ runner: fake.runner, blindQa })).toThrow(/absolute path/);
     }
@@ -2055,9 +2459,22 @@ describe("ALI-162: the blind seat fails closed when it is not properly wired", (
     expect(() => createClaudeCliAgentPort({ runner: fake.runner })).not.toThrow();
   });
 
+  it("has no implicit artifactRoot to fall back on (S4)", async () => {
+    const world = await makeBlindWorld();
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
+
+    // Round 1 defaulted `artifactRoot` to `process.cwd()`, which skipped the
+    // absolute-path guard entirely (`undefined` never enters the loop) and
+    // published the artifact wherever an unattended Routine happened to fire.
+    // The field is required now, so the omission is a compile error — and this
+    // asserts the runtime agrees, for the JS callers the compiler cannot reach.
+    const withoutRoot = { enginePath: world.enginePath } as unknown as BlindQaSeatConfig;
+    expect(() => createClaudeCliAgentPort({ runner: fake.runner, blindQa: withoutRoot })).toThrow(/absolute path/);
+  });
+
   it("refuses an empty acceptance-criteria context rather than burning a dispatch on it", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.quarantine);
+    const fake = createFakeClaudeCli(blindSeat(CONFORMING_FILES, CONFORMING_ENVELOPE), world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     const error = await thrownBy(() =>
@@ -2070,7 +2487,7 @@ describe("ALI-162: the blind seat fails closed when it is not properly wired", (
 
   it("is not reachable through dispatch(): `qa` is not a build seat", async () => {
     const world = await makeBlindWorld();
-    const fake = createFakeClaudeCli(undefined, world.quarantine);
+    const fake = createFakeClaudeCli(undefined, world.fakePolicy);
     const port = makePort(fake, { blindQa: world.blindQa });
 
     await expect(

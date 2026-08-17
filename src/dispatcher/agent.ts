@@ -103,11 +103,46 @@
  *      reported file list is checked against what is actually on disk in the
  *      staging directory, and only then copied into
  *      `.engine/blind-tests/<ISSUE-ID>/`. A reported path that escapes, a
- *      file written but not declared, or a symlink is a **hard error**. The
- *      `tools: Write` allowlist in `qa.md` (CI-enforced by
- *      `scripts/check-qa-tools-allowlist.js`) is the config half of the same
- *      property, and the two are independent on purpose — either one failing
- *      alone still leaves the other standing.
+ *      file written but not declared, or a symlink is a **hard error**.
+ *
+ *      **The seat's capability is pinned on the argv (bounce round 1, S1).**
+ *      Round 1 claimed `qa.md`'s `tools: Write` was the independent config
+ *      half of that property. It was not: `tools:` is *agent-definition*
+ *      frontmatter, and since this adapter deliberately passes no `--agent`
+ *      (ALI-161's S1), `qa.md` travels as system-prompt **prose** and the key
+ *      has no runtime effect at all. Probed against `claude` 2.1.233 with the
+ *      exact argv round 1 emitted, neutral system prompt, cwd = a fresh
+ *      staging dir holding a canary:
+ *
+ *        - round 1's argv → `CWD_READ=ZZCANARYZZ`, `BASH=BASHWORKS`,
+ *          `WRITE=DENIED`. The blind seat could **read and shell out**, and
+ *          could not write — the exact inverse of its contract, and the
+ *          write denial alone would have failed every real dispatch at the
+ *          manifest check.
+ *        - `--allowedTools Write` → **not** the fix. It is a *permission*
+ *          pre-approval, not a capability allowlist: `CWD_READ` still read
+ *          the canary. Worse (measured on disk, not from the model's
+ *          report): it also pre-approves writes *outside* cwd —
+ *          `relOutside=true absOutside=true` — so it would have handed the
+ *          seat write access to the engine checkout and every worktree.
+ *        - `--disallowed-tools Read Bash Edit … mcp__*` → capability really
+ *          removed: `CWD_READ=NOREAD`, `BASH=NOBASH`.
+ *        - `--permission-mode acceptEdits` alongside it → `Write` into cwd
+ *          succeeds promptlessly (`inCwd=true`) while both relative and
+ *          absolute writes outside cwd stay refused *on disk*
+ *          (`relOutside=false absOutside=false`).
+ *
+ *      So the argv now pins both, and the deny list is **derived from the
+ *      pinned `qa.md`'s own `tools:` key** (`parseSeatToolAllowlist`): every
+ *      tool the definition does not name is disallowed. That is what makes
+ *      the config half load-bearing rather than decorative — edit `tools:` in
+ *      the pinned tree and the child's capability changes with it; delete the
+ *      key and the dispatch fails closed.
+ *
+ *      The two controls are still independent, but the honest statement is
+ *      narrower than round 1's: `scripts/check-qa-tools-allowlist.js` guards
+ *      what `qa.md` may *say*, and this adapter is what makes what it says
+ *      *true of the process*.
  *
  * Ports and adapters, same discipline as `run.ts`: the subprocess boundary is
  * the injected `ProcessRunner`, so every criterion above is testable without
@@ -118,7 +153,8 @@
  */
 
 import { spawn as spawnProcess } from "node:child_process";
-import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { mkdir, mkdtemp, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
 
@@ -450,6 +486,159 @@ export function blindTestsRelativeDir(issueId: string): string {
   return join(...BLIND_TESTS_DIR_SEGMENTS, issueId);
 }
 
+// ---------------------------------------------------------------------------
+// The blind seat's capability pin (bounce round 1, S1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Every tool name `claude` 2.1.233 accepts as a permission-rule subject, as
+ * observed on the probe run recorded in this file's header.
+ *
+ * A **denylist against a named universe**, which is the weaker shape — this
+ * file's own `SEAT_ENV_ALLOWLIST` argues for allowlists, and the argument
+ * holds here too. It is used anyway because the CLI offers no capability
+ * allowlist: `--allowedTools` is a *permission* pre-approval and leaves every
+ * tool present (probed; it also grants writes outside cwd, which is worse than
+ * doing nothing). Two things bound the residual: the list is derived by
+ * complement from `qa.md`, so adding a tool to the definition is the only way
+ * to widen capability; and the CLI **validates deny-rule names**, printing
+ * `matches no known tool` for anything it does not recognise — which is how
+ * `MultiEdit` and `SlashCommand` were found not to exist on 2.1.233 and
+ * dropped from this table rather than left as decorative noise on every
+ * dispatch's stderr.
+ *
+ * A tool that a *future* CLI adds is not covered until this table is updated —
+ * an engine change, through the Amendment gate, like the model table above.
+ */
+export const BLIND_QA_TOOL_UNIVERSE: readonly string[] = Object.freeze([
+  "Agent",
+  "Artifact",
+  "Bash",
+  "BashOutput",
+  "Edit",
+  "EnterWorktree",
+  "ExitWorktree",
+  "Glob",
+  "Grep",
+  "KillShell",
+  "ListAgents",
+  "Monitor",
+  "NotebookEdit",
+  "Read",
+  "ReadNotifications",
+  "ReportFindings",
+  "ScheduleWakeup",
+  "SendUserFile",
+  "Skill",
+  "SuggestSkills",
+  "Task",
+  "TaskStop",
+  "TodoWrite",
+  "ToolSearch",
+  "WebFetch",
+  "WebSearch",
+  "Workflow",
+  "Write",
+]);
+
+/**
+ * Denied by wildcard rather than by name: every MCP tool is a potential read
+ * path and their names are not knowable in advance (a connected server
+ * registers whatever it likes). Probed as accepted by 2.1.233 — no
+ * `matches no known tool` warning, unlike a mistyped literal.
+ * `scripts/check-qa-tools-allowlist.js` bans `mcp__*` from `qa.md` on the same
+ * reasoning; this is the runtime half of that rule.
+ */
+export const MCP_TOOL_WILDCARD = "mcp__*";
+
+/**
+ * The tools whose absence is what "blind" *means*. `blindQaCapabilityIsPinned`
+ * asserts every one of these is denied, so a deny list that silently lost the
+ * one that matters cannot pass as pinned.
+ */
+export const READ_CAPABLE_TOOLS: readonly string[] = Object.freeze([
+  "Read",
+  "Bash",
+  "Edit",
+  "NotebookEdit",
+  "Glob",
+  "Grep",
+  "WebFetch",
+  "WebSearch",
+  "Task",
+  "Agent",
+  "Skill",
+  "ToolSearch",
+]);
+
+/**
+ * `acceptEdits`, probed as the one setting that grants what the seat needs
+ * without granting what it must not have: `Write` into cwd succeeds with no
+ * prompt, while relative *and* absolute writes outside cwd stay refused —
+ * verified on disk, not from the child's own report. Deliberately not
+ * `bypassPermissions`, which would lift exactly that boundary.
+ */
+export const BLIND_QA_PERMISSION_MODE = "acceptEdits";
+
+/**
+ * The blind seat's `tools:` frontmatter key could not be read from the pinned
+ * definition, or names something this runtime cannot pin. Fails closed: an
+ * unpinnable capability set is the S1 defect itself, so dispatching anyway
+ * would restore it.
+ */
+export class BlindQaToolPolicyError extends AgentDispatchError {
+  constructor(reason: string) {
+    super(
+      `cannot derive the blind seat's capability pin from the pinned qa.md: ${scrubSecrets(reason)}. ` +
+        "The `tools:` key is what the argv's --disallowed-tools list is computed from (bounce round 1, S1) — " +
+        "without it the child would run with the CLI's ambient tool set, which on 2.1.233 includes Read and Bash, " +
+        "and the seat's blindness would be prose rather than a property.",
+    );
+    this.name = "BlindQaToolPolicyError";
+  }
+}
+
+/**
+ * Reads a seat definition's `tools:` frontmatter key — the same key
+ * `scripts/check-qa-tools-allowlist.js` guards — and returns the tools it
+ * names. Strict: a missing frontmatter block, a missing/empty key, or a name
+ * outside `BLIND_QA_TOOL_UNIVERSE` throws, because each of those would silently
+ * produce a *wider* capability set than the definition describes.
+ */
+export function parseSeatToolAllowlist(definition: string): string[] {
+  const frontmatter = /^---\s*\n([\s\S]*?)\n---\s*(\n|$)/.exec(definition);
+  if (frontmatter === null) throw new BlindQaToolPolicyError("the definition has no YAML frontmatter block");
+
+  const toolsLine = /^tools:[ \t]*(.*)$/m.exec(frontmatter[1]);
+  if (toolsLine === null) throw new BlindQaToolPolicyError("the frontmatter has no `tools:` key");
+
+  const tools = toolsLine[1]
+    .split(",")
+    .map((tool) => tool.trim())
+    .filter((tool) => tool !== "");
+  if (tools.length === 0) throw new BlindQaToolPolicyError("the `tools:` key names no tool");
+
+  const unknown = tools.filter((tool) => !BLIND_QA_TOOL_UNIVERSE.includes(tool));
+  if (unknown.length > 0) {
+    throw new BlindQaToolPolicyError(
+      `the \`tools:\` key names ${unknown.join(", ")}, which this runtime cannot pin — the CLI reports an ` +
+        "unrecognised permission-rule subject as a warning and carries on, so an unknown name here would be a " +
+        "capability nobody is actually restricting",
+    );
+  }
+  return tools;
+}
+
+/**
+ * The capability/permission flags for a seat whose definition allows exactly
+ * `allowed`. Everything in the universe that the definition does not name is
+ * disallowed, plus every MCP tool by wildcard.
+ */
+export function buildSeatToolPolicyArgs(allowed: readonly string[]): string[] {
+  const disallowed = BLIND_QA_TOOL_UNIVERSE.filter((tool) => !allowed.includes(tool));
+  return ["--permission-mode", BLIND_QA_PERMISSION_MODE, "--disallowed-tools", ...disallowed, MCP_TOOL_WILDCARD];
+}
+
 /**
  * Engine tier → the **concrete model id** passed as `--model`.
  *
@@ -507,13 +696,19 @@ const CWD_ROOTED_SETTING_SOURCES: readonly string[] = ["project", "local"];
  * body — still do. stdin carries the work prompt; nothing secret is anywhere
  * on the command line.
  */
-export function buildSeatArgv(params: { modelId: string; systemPrompt: string }): string[] {
+export function buildSeatArgv(params: { modelId: string; systemPrompt: string; policy?: readonly string[] }): string[] {
   return [
     "--print",
     "--model",
     params.modelId,
     "--setting-sources",
     PINNED_SETTING_SOURCES,
+    // The blind seat's capability/permission pins (ALI-162 S1). Placed before
+    // `--system-prompt` because `--disallowed-tools` is variadic: it consumes
+    // values until the next flag, so it can never be the last flag on the
+    // argv. Empty for the build seats, whose tool set is deliberately the
+    // full one — they have to build.
+    ...(params.policy ?? []),
     "--system-prompt",
     params.systemPrompt,
   ];
@@ -548,6 +743,38 @@ export function settingSourcesArgFrom(args: readonly string[]): string | undefin
 /** Reads `--system-prompt`'s value out of a recorded argv. */
 export function systemPromptArgFrom(args: readonly string[]): string | undefined {
   return flagValue(args, "--system-prompt");
+}
+
+/** Reads `--permission-mode`'s value out of a recorded argv. */
+export function permissionModeArgFrom(args: readonly string[]): string | undefined {
+  return flagValue(args, "--permission-mode");
+}
+
+/**
+ * Reads every value of the variadic `--disallowed-tools` flag out of a
+ * recorded argv (it takes a list, unlike every other flag here, so
+ * `flagValue` would see only the first entry).
+ */
+export function disallowedToolsFrom(args: readonly string[]): string[] {
+  const index = args.indexOf("--disallowed-tools");
+  if (index < 0) return [];
+  const values: string[] = [];
+  for (let i = index + 1; i < args.length && !args[i].startsWith("--"); i++) values.push(args[i]);
+  return values;
+}
+
+/**
+ * True when an invocation cannot read, shell out, or otherwise look at
+ * anything — the predicate the blind-seat tests and the faithful fake both
+ * assert on, so what the *child can do* is checked rather than what the parent
+ * meant. Deliberately expressed as "every read-capable tool is denied" rather
+ * than "the flag is present": a `--disallowed-tools` that had quietly lost
+ * `Read` would still satisfy the weaker check.
+ */
+export function blindQaCapabilityIsPinned(args: readonly string[]): boolean {
+  if (permissionModeArgFrom(args) !== BLIND_QA_PERMISSION_MODE) return false;
+  const denied = new Set(disallowedToolsFrom(args));
+  return READ_CAPABLE_TOOLS.every((tool) => denied.has(tool));
 }
 
 /**
@@ -1104,11 +1331,16 @@ function renderBlindWorkPrompt(ctx: BlindDispatchContext): string {
       BLIND_QA_MANIFEST_FILENAME +
       " into your CURRENT WORKING DIRECTORY, using plain relative filenames.",
     `The runtime places whatever you write there into ${join(...BLIND_TESTS_DIR_SEGMENTS, "<ISSUE-ID>")}/ at the` +
-      " engine checkout root — you do not need, and must not construct, that prefix or any absolute path.",
+      " engine checkout root — you do not need, and must not construct, that prefix or any absolute path. A",
+    `declared path carrying the ${join(...BLIND_TESTS_DIR_SEGMENTS)}/ prefix is refused, because the runtime has`,
+    "already resolved that directory and a second copy of it would nest one issue's artifact inside another's.",
     "Do not write outside your working directory (no absolute paths, no `..`, no symlinks): the runtime verifies",
     "this against the filesystem and refuses the whole dispatch if a write escapes.",
     `Every file you write must be declared in ${BLIND_QA_RESULT_SENTINEL}'s testFilesWritten — an undeclared file`,
     "is also a refusal, and so is a declared file that is not there.",
+    `If you write anything at all, one of the files must be ${BLIND_QA_MANIFEST_FILENAME}. If EVERY criterion turns`,
+    `out to be untestable, still write ${BLIND_QA_MANIFEST_FILENAME} recording them by number — a run that reports`,
+    "untestable criteria and no artifact is accepted, but it leaves the reviewer nothing to read.",
     "</artifact-contract>",
     "",
     "<output-contract>",
@@ -1167,6 +1399,64 @@ async function walkArtifactFiles(root: string, dir = root): Promise<string[]> {
 }
 
 /**
+ * Copies one verified file into the artifact, without ever following a link —
+ * the fix for bounce round 1's S2.
+ *
+ * The walk above is time-of-**check** and a plain `copyFile` is
+ * time-of-**use**, and `copyFile` follows symlinks at the source. Round 1 left
+ * a window between the two, and the security pass proved it exploitable: a
+ * process still alive after the child exited swapped a verified regular file
+ * for a symlink, and the dispatch published the contents of a file outside the
+ * staging root as a blind test file, reported in `testFilesWritten` as
+ * legitimate. Widening the check cannot close that — any check can be raced —
+ * so the *use* is what changed:
+ *
+ *   - `O_NOFOLLOW` makes the open itself fail (`ELOOP`) if the path became a
+ *     symlink; the bytes are then read from that descriptor, which cannot be
+ *     re-pointed afterwards.
+ *   - `fstat` on the same descriptor confirms it is a regular file — a check
+ *     on the object, not on a name that could since have been re-bound.
+ *   - the destination is opened `wx` (`O_CREAT|O_EXCL`), so a pre-planted
+ *     symlink or leftover file at the target is a failure rather than a
+ *     silently followed write.
+ *
+ * The other half of the fix is in `raceWithTimeout`, which now reaps the
+ * child's process group on **every** exit path: the window class is "something
+ * of the seat's is still running after the dispatch returned", not just this
+ * one instance of it.
+ */
+export async function copyVerifiedFile(source: string, destination: string, relativePath: string): Promise<void> {
+  // `O_NOFOLLOW` is POSIX; the `?? 0` keeps this from becoming `NaN` on a
+  // platform that does not define it (the engine runs on Linux, where it does).
+  const noFollow = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
+  let handle;
+  try {
+    handle = await open(source, noFollow);
+  } catch (cause) {
+    const code = (cause as NodeJS.ErrnoException).code;
+    throw new BlindQaArtifactError(
+      code === "ELOOP"
+        ? `${relativePath} became a symlink between verification and copy — refusing to publish bytes from ` +
+          "wherever it now points (the TOCTOU the security pass proved exploitable)"
+        : `${relativePath} could not be opened for publication (${code ?? "unknown error"})`,
+    );
+  }
+  try {
+    const stats = await handle.stat();
+    if (!stats.isFile()) {
+      throw new BlindQaArtifactError(`${relativePath} is no longer a regular file at the moment its bytes are read`);
+    }
+    const bytes = await handle.readFile();
+    // `wx` = O_CREAT|O_EXCL: never follow, never overwrite. The destination
+    // directory is cleared immediately before this, so anything already at the
+    // path was planted between the two.
+    await writeFile(destination, bytes, { flag: "wx" });
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
  * Normalizes one reported path and refuses anything that could land outside
  * the staging directory: absolute paths, `..` traversal, and (defensively) a
  * resolved path that is not under the root even after normalization.
@@ -1182,6 +1472,22 @@ function confineReportedPath(stagingDir: string, reported: string): string {
   if (normalized === ".." || normalized.startsWith(`..${sep}`)) {
     throw new BlindQaArtifactError(
       `reported path ${JSON.stringify(reported)} escapes the artifact directory via ..`,
+    );
+  }
+  // Decided explicitly rather than left to fall out of the code (reviewer
+  // finding): a declared `.engine/blind-tests/ALI-999/x` is syntactically
+  // clean and confined, so nothing above rejects it — but publishing it would
+  // silently nest one issue's directory inside another's, and a reviewer
+  // reading `.engine/blind-tests/ALI-162/.engine/blind-tests/ALI-999/x` has no
+  // way to tell whose test it is. The prompt already tells the seat not to
+  // build that prefix; this makes ignoring the instruction loud instead of
+  // quietly wrong.
+  const blindTestsPrefix = join(...BLIND_TESTS_DIR_SEGMENTS);
+  if (normalized === blindTestsPrefix || normalized.startsWith(`${blindTestsPrefix}${sep}`)) {
+    throw new BlindQaArtifactError(
+      `reported path ${JSON.stringify(reported)} carries the ${blindTestsPrefix}/ prefix — the runtime resolves ` +
+        "that directory itself, so a declared copy of it would nest one issue's artifact inside another's " +
+        "rather than escape; declare plain filenames relative to the working directory",
     );
   }
   // Belt-and-braces after the syntactic checks above: whatever the path looked
@@ -1240,8 +1546,14 @@ async function publishBlindArtifact(params: {
   // invariant) it traces to". Without it the artifact cannot be traced back to
   // the criteria, which is the only thing that makes it a blind *test* suite
   // rather than a pile of files.
+  //
+  // Required only once the seat has written something (bounce round 1, S6).
+  // Round 1 required it unconditionally, which made the honest all-untestable
+  // outcome — no test files, every criterion named as untestable — fail the
+  // dispatch, so those numbers never reached the run log at all. That is the
+  // thing ALI-105's AC8 exists to prevent, arrived at from the loud side.
   const hasManifest = [...declared].some((path) => path.split(sep).pop() === BLIND_QA_MANIFEST_FILENAME);
-  if (!hasManifest) {
+  if (declared.size > 0 && !hasManifest) {
     throw new BlindQaArtifactError(
       `no ${BLIND_QA_MANIFEST_FILENAME} in the artifact — qa.md's contract requires one per issue, tracing each ` +
         "test file to the numbered criterion (or the invariant) it came from",
@@ -1250,14 +1562,51 @@ async function publishBlindArtifact(params: {
 
   const relativeDir = blindTestsRelativeDir(issueId);
   const destinationDir = join(artifactRoot, relativeDir);
-  const published: string[] = [];
-  for (const path of [...declared].sort()) {
-    const destination = join(destinationDir, path);
-    await mkdir(dirname(destination), { recursive: true });
-    await copyFile(join(stagingDir, path), destination);
-    published.push(join(relativeDir, path));
+  const parentDir = dirname(destinationDir);
+  await mkdir(parentDir, { recursive: true });
+
+  // Nothing to publish (the all-untestable case, S6). The destination is still
+  // cleared: a previous dispatch's artifact must not survive as if it were
+  // this run's.
+  if (declared.size === 0) {
+    await rm(destinationDir, { recursive: true, force: true });
+    return [];
   }
-  return published;
+
+  // Build the artifact beside its destination, then swap it in with a single
+  // `rename`. Two findings meet here:
+  //
+  //   - S3: round 1 only ever *added* to the destination, so a re-dispatch
+  //     after a bounce left the previous attempt's files in place —
+  //     undeclared, absent from `testFilesWritten`, and read and run by the
+  //     reviewer as if they belonged to this run. The published directory is
+  //     the only one the reviewer sees, so "exactly the paths written" has to
+  //     be true of *it*, not merely of staging.
+  //   - Copy-time rejection (S2) can now fail *mid-loop*, which a
+  //     copy-in-place would leave half-published — and round 1's "never a
+  //     partial publish" was only true while every check preceded every write.
+  //     Building aside and renaming keeps that promise literally: the
+  //     destination goes from the old artifact to the new one in one step, and
+  //     a failure anywhere leaves the old one untouched rather than deleting
+  //     it in favour of nothing.
+  const pending = await mkdtemp(join(parentDir, `.${issueId}.publishing-`));
+  try {
+    const published: string[] = [];
+    for (const path of [...declared].sort()) {
+      const destination = join(pending, path);
+      await mkdir(dirname(destination), { recursive: true });
+      await copyVerifiedFile(join(stagingDir, path), destination, path);
+      published.push(join(relativeDir, path));
+    }
+    await rm(destinationDir, { recursive: true, force: true });
+    await rename(pending, destinationDir);
+    return published;
+  } finally {
+    // No-op once the rename has moved it; cleanup on every failure path.
+    await rm(pending, { recursive: true, force: true }).catch(() => {
+      /* best-effort: never mask the failure that brought us here */
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1298,15 +1647,22 @@ export interface BlindQaSeatConfig {
    * Root that `.engine/blind-tests/<ISSUE-ID>/` resolves against: the engine
    * checkout root, per `qa.md`'s artifact contract, and **never** a builder
    * worktree — the quarantine is what stops a diff-authoring seat editing an
-   * assertion. Defaults to `process.cwd()`, the same default (and the same
-   * reasoning) as `run.ts`'s `writeRunLog(..., baseDir)`.
+   * assertion.
+   *
+   * **Required, deliberately** (bounce round 1, S4). Round 1 defaulted it to
+   * `process.cwd()`, which walked straight past the absolute-path check below:
+   * `undefined` skipped validation and the artifact landed wherever the run
+   * happened to fire — which, for an unattended Routine, is not a location
+   * anyone chose. A guard that rejects a bad explicit value while accepting an
+   * unchosen implicit one is not a guard. The cost is one field at a call site
+   * ALI-121 has to write anyway.
    *
    * A deployment may point this at a directory outside the engine checkout
    * entirely; this adapter only ever writes under
    * `<artifactRoot>/.engine/blind-tests/<ISSUE-ID>/` and does not care what is
    * above it.
    */
-  artifactRoot?: string;
+  artifactRoot: string;
   /**
    * Where each dispatch's throwaway staging directory is created. Defaults to
    * the OS temp dir. Injectable so the confinement tests can watch a real
@@ -1356,12 +1712,15 @@ export function createClaudeCliAgentPort(config: ClaudeCliAgentConfig): AgentPor
   // fires, which for an unattended Routine is not a value anyone chose. Better
   // to refuse the port than to publish an artifact somewhere surprising.
   if (config.blindQa !== undefined) {
-    for (const [field, value] of Object.entries({
-      enginePath: config.blindQa.enginePath,
-      artifactRoot: config.blindQa.artifactRoot,
-      stagingRoot: config.blindQa.stagingRoot,
-    })) {
-      if (value === undefined) continue;
+    for (const [field, value, required] of [
+      ["enginePath", config.blindQa.enginePath, true],
+      // Required, and therefore validated even when absent (S4): the round-1
+      // `?? process.cwd()` default meant `undefined` skipped this loop, which
+      // is how a guard came to accept the one value nobody chose.
+      ["artifactRoot", config.blindQa.artifactRoot, true],
+      ["stagingRoot", config.blindQa.stagingRoot, false],
+    ] as const) {
+      if (value === undefined && !required) continue;
       if (typeof value !== "string" || value.trim() === "" || !isAbsolute(value)) {
         throw new AgentDispatchError(
           `blindQa.${field} must be an absolute path (got ${JSON.stringify(value)}) — the blind seat's artifact ` +
@@ -1471,13 +1830,24 @@ export function createClaudeCliAgentPort(config: ClaudeCliAgentConfig): AgentPor
         throw new EngineDefinitionUnreadableError(definitionPath, cause);
       }
 
-      const artifactRoot = blindConfig.artifactRoot ?? process.cwd();
+      // The capability pin, derived from the pinned definition's own `tools:`
+      // key (bounce round 1, S1). Throws rather than dispatching if that key
+      // is missing or unpinnable — an un-pinned blind seat holds Read and Bash.
+      const policy = buildSeatToolPolicyArgs(parseSeatToolAllowlist(definition));
+
+      const { artifactRoot } = blindConfig;
       const stagingRoot = blindConfig.stagingRoot ?? tmpdir();
       await mkdir(stagingRoot, { recursive: true });
-      // `mkdtemp` gives a directory that did not exist a moment ago and is not
-      // shared with any other dispatch — no stale artifact can be mistaken for
-      // this seat's output, and no other seat can read this one's.
-      const stagingDir = await mkdtemp(join(stagingRoot, "engine-blind-qa-"));
+      // Two levels, not one (bounce round 1, S7): the container is what gets
+      // removed, and cwd sits one level inside it, so the single most likely
+      // escape — a relative `../something` write — lands inside the container
+      // and is cleaned with it instead of accumulating in the temp root
+      // forever. `mkdtemp` gives a directory that did not exist a moment ago
+      // and is shared with no other dispatch, so no stale artifact can be
+      // mistaken for this seat's output and no other seat can read this one's.
+      const stagingContainer = await mkdtemp(join(stagingRoot, "engine-blind-qa-"));
+      const stagingDir = join(stagingContainer, "work");
+      await mkdir(stagingDir);
 
       try {
         const handle = config.runner.spawn({
@@ -1485,6 +1855,7 @@ export function createClaudeCliAgentPort(config: ClaudeCliAgentConfig): AgentPor
           args: buildSeatArgv({
             modelId: TIER_MODEL_IDS[BLIND_QA_TIER],
             systemPrompt: renderSeatSystemPrompt({ seat: BLIND_QA_DEFINITION, definition }),
+            policy,
           }),
           cwd: stagingDir,
           // The same allowlist projection the build seats get. It carries no
@@ -1529,11 +1900,12 @@ export function createClaudeCliAgentPort(config: ClaudeCliAgentConfig): AgentPor
         if (envelope.effort !== undefined) blindResult.effort = envelope.effort;
         return blindResult;
       } finally {
-        // The staging directory is throwaway by design: on the happy path its
-        // contents are already published, and on every failure path the named
-        // error carries what went wrong. Leaving it behind would accumulate
-        // partial artifacts under the temp root for every bounced dispatch.
-        await rm(stagingDir, { recursive: true, force: true }).catch(() => {
+        // The whole container, not just cwd (S7) — so a one-level escape is
+        // cleaned too. Throwaway by design: on the happy path its contents are
+        // already published, and on every failure path the named error carries
+        // what went wrong. Leaving it behind would accumulate partial artifacts
+        // under the temp root for every bounced dispatch.
+        await rm(stagingContainer, { recursive: true, force: true }).catch(() => {
           /* best-effort cleanup: never mask the real outcome of the dispatch */
         });
       }
@@ -1593,24 +1965,45 @@ async function raceWithTimeout(
     /* the timeout path may abandon this promise; never let it go unhandled */
   });
 
+  // Exactly once, whatever path we leave by. `kill()` is a process-*group*
+  // signal (see `createNodeProcessRunner`), so on the success path — where the
+  // direct child has already exited — this is a reap of whatever it left
+  // behind, not a kill of the seat.
+  let reaped = false;
+  const reapGroup = (): void => {
+    if (reaped) return;
+    reaped = true;
+    try {
+      handle.kill();
+    } catch {
+      // Reclaiming the child is best-effort; an exception here must never
+      // escape the timer callback (see this function's doc comment).
+    }
+  };
+
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race<ProcessResult>([
       exited,
       new Promise<ProcessResult>((_resolve, reject) => {
         timer = setTimeout(() => {
-          try {
-            handle.kill();
-          } catch {
-            // Reclaiming the child is best-effort; an exception here must never
-            // escape the timer callback (see this function's doc comment).
-          }
+          reapGroup();
           reject(onTimeout());
         }, timeoutMs);
       }),
     ]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    // Bounce round 1, S2 (second half). Round 1 reaped only on the timeout
+    // path, so a *successful* dispatch could return while a grandchild of the
+    // seat was still running — with the child's environment and a cwd inside
+    // the run's directories. That is what made the artifact TOCTOU reachable
+    // (the security pass swapped a verified file for a symlink after `exited`
+    // resolved), and it is a window class rather than one instance: the same
+    // survivor could keep writing to a build seat's worktree after the run has
+    // parked it and opened its PR. Reaping here closes it for both dispatch
+    // methods, before either one touches the filesystem.
+    reapGroup();
   }
 }
 
