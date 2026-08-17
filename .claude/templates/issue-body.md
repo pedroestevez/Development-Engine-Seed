@@ -18,9 +18,31 @@ you haven't made.
 
 ## Acceptance criteria
 
-Numbered. Each one testable from this issue alone, today, with no further
-questions (gate 1). One named failure mode per risk label (gate 2) — negative
-cases, failure modes, authz paths.
+**Outcome only.** Numbered. Each one testable from this issue alone, today,
+with no further questions (gate 1). One named failure mode per risk label
+(gate 2) — negative cases, failure modes, authz paths. A criterion that
+embeds an unpinned literal — a bare line number, file path, count, exact
+string, UI control, or command sequence with no evidence block behind it —
+fails gate 8. Move it to `## Procedure` below, either pinned with its
+evidence block or left as a build-time enumeration.
+
+## Procedure (pinned or enumerated at build time)
+
+Optional. Only for a criterion above that genuinely needs a line number, file
+path, count, exact string, UI control, or command sequence. Each such item
+carries gate 8's evidence block:
+
+```
+SOURCE:   <SHA, URL, or query the literal was read from>
+READ AT:  <timestamp>
+LITERAL:  <what was read>
+```
+
+Unpinned procedural detail belongs here only as an instruction to enumerate
+at build time ("read the live tree; do X for every match") — never as a
+remembered literal. Outcome and invariant are written at grooming and stay
+durable; procedure written at groom time rots before the build runs unless
+it is pinned here.
 
 ## Invariant
 
@@ -28,8 +50,11 @@ What must never become false, in checkable terms (gate 3).
 
 ## Definition of done
 
-The done-state, testable. Which criterion proves the work has teeth rather than
-merely being green.
+**Cite the standing Definition of Done** (`docs/ENGINE.md` §19) — do not
+restate its clauses. State here only what is specific to this issue: which
+criterion is load-bearing and proves the work has teeth rather than merely
+being green, or an issue-specific demonstration the standing bar doesn't
+already require.
 
 ## Files touched (predicted)
 
