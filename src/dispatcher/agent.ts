@@ -11,18 +11,51 @@
  *
  * Three properties are enforced **here and nowhere else**:
  *
- *   1. **The pinned engine tree is the only source of `.claude/**`.** The
- *      seat's definition is read from `DispatchContext.enginePath` — the
- *      run's read-only detached checkout at its resolved pin (ALI-104) — and
- *      never from `worktreePath`, which is mutable and, in this repo, is
- *      routinely *the thing being edited* (docs/ENGINE.md §16: "a builder
- *      issue here legitimately edits `.claude/**` as its actual work"). If
- *      the definition came from the worktree, a run could rewrite the
- *      instructions it is currently executing under, mid-run — the loop
- *      changing the loop, with no diff anyone reads. If `enginePath` is
- *      missing or unreadable this adapter **throws**; there is deliberately
- *      no fallback path to the worktree, because a fallback is exactly the
- *      silent failure the pin exists to prevent.
+ *   1. **The seat's instructions come from the pinned engine tree, and the
+ *      mutable worktree cannot contribute any.** This has two halves, and
+ *      bounce round 1 (security finding S1) established that only naming the
+ *      first is a false claim:
+ *
+ *      *In-process half* — the definition is read from
+ *      `DispatchContext.enginePath`, the run's detached checkout at its
+ *      resolved pin (ALI-104), never from `worktreePath`, which is mutable
+ *      and, in this repo, routinely *the thing being edited* (docs/ENGINE.md
+ *      §16: "a builder issue here legitimately edits `.claude/**` as its
+ *      actual work"). If `enginePath` is missing or unreadable this adapter
+ *      **throws**; there is deliberately no fallback to the worktree,
+ *      because a fallback is exactly the silent failure the pin exists to
+ *      prevent.
+ *
+ *      *Delegated half* — the child process does its own `.claude/**`
+ *      discovery, rooted at **cwd**, which is the worktree (AC4). Reading the
+ *      right file in the parent does nothing about that, so the invocation
+ *      must suppress it. Probed against `claude` 2.1.233 (round 1 shipped
+ *      without this and was bounced for it):
+ *
+ *        - cwd holding `.claude/agents/builder.md`, argv `--agent zz-nope`
+ *          → "not found. Available agents: **builder**, claude, …" — the
+ *          worktree copy is discovered, and it governs as the session's
+ *          system prompt while the pinned text on stdin is mere user prose.
+ *        - cwd holding `.claude/settings.json` with a `SessionStart` command
+ *          hook → **the hook executes**, before any seat work, with the
+ *          child's environment. Arbitrary command execution from a file the
+ *          previous seat in the same run may have written.
+ *        - Both stop when argv carries `--setting-sources user`: `builder`
+ *          disappears from the discovered list and the hook does not run.
+ *        - `--system-prompt <text>` then governs (probe: the child obeyed the
+ *          flag's instruction over the user message).
+ *
+ *      So `buildSeatArgv` suppresses project/local setting sources and passes
+ *      the pinned definition as the governing system prompt. `--agent` is
+ *      deliberately **not** passed: its whole job is to resolve a name
+ *      through the discovery hierarchy this adapter is closing off.
+ *
+ *      **Residual, stated rather than papered over:** `--setting-sources
+ *      user` still loads `~/.claude/**`. That scope is operator-controlled,
+ *      not issue-controlled — no seat can write it as part of its work — so
+ *      it is an accepted residual, but it means "the pinned tree is the only
+ *      source of `.claude/**`" is true of *project* scope, not literally of
+ *      every scope. ALI-157 owns the unattended run environment's `HOME`.
  *
  *   2. **Every seat's model is explicit.** `--model <id>` is always on the
  *      argv, derived from the issue's computed tier
@@ -114,10 +147,22 @@ export interface ProcessRunner {
 // "never guess on ambiguity" conduct rule.
 // ---------------------------------------------------------------------------
 
-/** Base class for every failure raised by this adapter, so callers can catch the family. */
+/**
+ * Base class for every failure raised by this adapter, so callers can catch the
+ * family — and the one place secret scrubbing is applied to error text.
+ *
+ * Bounce round 1, S4: several of these messages embed data that came from the
+ * child (a `JSON.parse` excerpt of stdout, an echoed unknown field name) and
+ * `containsSecretLike()` returned **true** on them. A throw is a record path
+ * like any other: `run.ts` has no `catch` around `deps.agent.dispatch`, so the
+ * message lands wherever the run is logged, and the first catch-and-comment
+ * handler anyone adds turns it into a Linear leak. Scrubbing in this
+ * constructor covers every subclass and every future construction site, rather
+ * than relying on each call site to remember.
+ */
 export class AgentDispatchError extends Error {
   constructor(message: string) {
-    super(message);
+    super(scrubSecrets(message));
     this.name = "AgentDispatchError";
   }
 }
@@ -181,8 +226,12 @@ export class SeatOutputParseError extends AgentDispatchError {
     readonly seat: Seat,
     reason: string,
   ) {
+    // `reason` routinely quotes child stdout — a V8 JSON.parse excerpt, or an
+    // unrecognized field name echoed in full. `AgentDispatchError` scrubs the
+    // composed message (S4); the explicit call here documents that this is the
+    // path that carries child-controlled text.
     super(
-      `seat ${seat} produced no valid result envelope: ${reason}. ` +
+      `seat ${seat} produced no valid result envelope: ${scrubSecrets(reason)}. ` +
         `Expected exactly one line beginning ${SEAT_RESULT_SENTINEL} followed by a JSON object. ` +
         "Refusing to report a clean summary for output this runtime cannot understand — " +
         "`bounced` and `ambiguous` are only ever read from that envelope, never inferred from prose.",
@@ -257,33 +306,97 @@ export const TIER_MODEL_IDS: Readonly<Record<ModelTier, string>> = Object.freeze
 export const PINNED_MODEL_IDS: readonly string[] = Object.freeze(Object.values(TIER_MODEL_IDS));
 
 /**
- * Builds the argv for one seat invocation. Small on purpose: the prompt (seat
- * definition + issue facts + output contract) travels on stdin, so argv
- * carries only the two things that must be *inspectable* from outside the
- * process — which model is pinned, and which seat is running.
- *
- * `--print` is the CLI's non-interactive mode (prompt read from stdin).
- * `--model` is property 2. `--agent` labels the seat; the definition text
- * itself is inlined in the prompt from the pinned tree rather than left to
- * cwd discovery, because cwd is the *worktree* — discovery there is exactly
- * the self-modification hole property 1 closes.
+ * The setting scopes the child is allowed to load. `user` only: `project` and
+ * `local` are rooted at cwd — the worktree — and loading them hands the
+ * session's agent definitions and its `settings.json` hooks to whatever the
+ * previous seat happened to write there (S1). See the header's probe log.
  */
-export function buildSeatArgv(seat: Seat, modelId: string): string[] {
-  return ["--print", "--model", modelId, "--agent", seat];
+export const PINNED_SETTING_SOURCES = "user";
+
+/** Scopes that must never appear in `--setting-sources`, because both resolve against cwd. */
+const CWD_ROOTED_SETTING_SOURCES: readonly string[] = ["project", "local"];
+
+/**
+ * Builds the argv for one seat invocation. Four flags, each load-bearing:
+ *
+ *   - `--print` — non-interactive; the *work* prompt arrives on stdin.
+ *   - `--model <id>` — property 2, the explicit pin.
+ *   - `--setting-sources user` — property 1's delegated half: suppresses
+ *     cwd-rooted discovery of `.claude/agents/**` and `.claude/settings.json`
+ *     hooks in the worktree.
+ *   - `--system-prompt <pinned definition>` — because the flag above also
+ *     un-discovers the seat's *name*, the definition has to be supplied
+ *     explicitly, and this is the flag probed to actually govern the session.
+ *
+ * `--agent` is deliberately absent (it was present in round 1 and is the
+ * mechanism S1 exploits): its purpose is to resolve a name through the
+ * discovery hierarchy this argv closes off, and under `--setting-sources user`
+ * the real CLI rejects it outright ("not found. Available agents: …").
+ *
+ * The definition text rides on argv rather than stdin. argv is `ps`-visible,
+ * so this is a deliberate trade: the definition is a tracked, non-secret repo
+ * file, while the things that must stay off argv — credentials and the issue
+ * body — still do. stdin carries the work prompt; nothing secret is anywhere
+ * on the command line.
+ */
+export function buildSeatArgv(params: { modelId: string; systemPrompt: string }): string[] {
+  return [
+    "--print",
+    "--model",
+    params.modelId,
+    "--setting-sources",
+    PINNED_SETTING_SOURCES,
+    "--system-prompt",
+    params.systemPrompt,
+  ];
+}
+
+function flagValue(args: readonly string[], flag: string): string | undefined {
+  const index = args.indexOf(flag);
+  if (index < 0) return undefined;
+  return args[index + 1];
 }
 
 /** Reads `--model`'s value out of a recorded argv. Exported so tests (and ALI-162) assert on the pin, not on argv shape. */
 export function modelArgFrom(args: readonly string[]): string | undefined {
-  const index = args.indexOf("--model");
-  if (index < 0) return undefined;
-  return args[index + 1];
+  return flagValue(args, "--model");
 }
 
-/** Reads `--agent`'s value out of a recorded argv (same reasoning as `modelArgFrom`). */
+/**
+ * Reads `--agent`'s value out of a recorded argv. This adapter never emits the
+ * flag; the accessor stays because the fake's rejection rule and its
+ * regression test are written against it — re-introducing `--agent` must fail
+ * loudly rather than quietly restore S1.
+ */
 export function seatArgFrom(args: readonly string[]): string | undefined {
-  const index = args.indexOf("--agent");
-  if (index < 0) return undefined;
-  return args[index + 1];
+  return flagValue(args, "--agent");
+}
+
+/** Reads `--setting-sources`' value out of a recorded argv. */
+export function settingSourcesArgFrom(args: readonly string[]): string | undefined {
+  return flagValue(args, "--setting-sources");
+}
+
+/** Reads `--system-prompt`'s value out of a recorded argv. */
+export function systemPromptArgFrom(args: readonly string[]): string | undefined {
+  return flagValue(args, "--system-prompt");
+}
+
+/**
+ * True when an invocation cannot load cwd-rooted (`project`/`local`) settings —
+ * i.e. when the worktree's `.claude/**` cannot govern the child. The predicate
+ * the fake and the AC3 tests both assert on, so "what the child would load" is
+ * checked rather than "what the parent assembled".
+ */
+export function suppressesProjectSettingSources(args: readonly string[]): boolean {
+  const value = settingSourcesArgFrom(args);
+  if (value === undefined) return false;
+  const scopes = value
+    .split(",")
+    .map((scope) => scope.trim().toLowerCase())
+    .filter((scope) => scope !== "");
+  if (scopes.length === 0) return false;
+  return !scopes.some((scope) => CWD_ROOTED_SETTING_SOURCES.includes(scope));
 }
 
 // ---------------------------------------------------------------------------
@@ -293,11 +406,23 @@ export function seatArgFrom(args: readonly string[]): string | undefined {
 /**
  * The **only** variables a seat's child process inherits. An allowlist, not a
  * denylist: a denylist silently passes every credential someone adds to the
- * run environment later, and the run environment holds several the seat has
- * no business seeing — the Linear and GitHub credentials belong to the run
- * loop's own ports (`LinearPort`, `GitHubPort`), not to the agent. A seat
- * needs enough to run git and tests (`PATH`, `HOME`, locale/TZ) plus its own
- * model credential, and nothing else.
+ * run environment later. A seat needs enough to run git and tests (`PATH`,
+ * `HOME`, locale/TZ) plus its own model credential, and nothing else.
+ *
+ * What this does and does not buy (corrected in bounce round 1, S7): no
+ * `LINEAR_*`, `GITHUB_*` or `GH_*` **name** reaches the child, so the run's
+ * own port credentials are not handed over as environment. It is *not* a
+ * credential boundary, because `HOME` is on the list: any command the seat
+ * runs can still read `~/.config/gh/hosts.yml`, `~/.claude/.credentials.json`,
+ * or a `~/.gitconfig` credential helper. The names are excluded; the access is
+ * not. If the unattended run environment authenticates `git`/`gh` through the
+ * run user's `HOME`, the seat needs its own `HOME` — ALI-157's scope, noted
+ * there rather than papered over here.
+ *
+ * Related, also from S7: `scrubSecrets` knows exactly four prefixes (`ghp_`,
+ * `github_pat_`, `lin_api_`, `sk-`), so AC7 is proven for those and no
+ * further — an `ANTHROPIC_AUTH_TOKEN` of arbitrary bearer/JWT shape is outside
+ * that vocabulary. Stated rather than silently widened here.
  */
 export const SEAT_ENV_ALLOWLIST: readonly string[] = Object.freeze([
   "PATH",
@@ -544,35 +669,52 @@ function issueBody(issue: DispatchContext["issue"]): string {
 }
 
 /**
- * Assembles the seat's prompt: the pinned definition first, then the issue's
- * facts, then the output contract.
+ * The seat's **governing** instructions: the definition, verbatim from the
+ * pinned tree, passed as `--system-prompt`.
  *
- * Order is a trust boundary, not formatting. The seat's *instructions* come
- * from the pinned tree (`<seat>`); the issue's title and body come from Linear
- * and are therefore lower-trust input — they are enclosed in their own
- * `<issue>` element so the seat reads them as the work item, not as further
- * instructions. Nothing in this function can add to what the pinned definition
- * says a seat may do; that remains a property of the pin and of the seat's own
- * tool allowlist (e.g. `.claude/agents/qa.md`), never of prompt text.
+ * Round 1 put this text on stdin, where it was merely part of the user message
+ * while the worktree's own copy governed as the system prompt (S1). Which
+ * channel the text travels on is the whole property, not a formatting choice:
+ * probed against `claude` 2.1.233, `--system-prompt` governs and stdin prose
+ * does not.
+ *
+ * Deliberately carries no filesystem path. Round 1 disclosed the pinned tree's
+ * absolute path to the child (S3); the tree is writable by the same uid, so
+ * naming it invited a seat to edit the definitions a *later* seat in the same
+ * run would read — property 1 defeated through the trusted path. The seat needs
+ * no path: its instructions are already here.
  */
-function renderPrompt(params: {
-  seat: Seat;
-  ctx: DispatchContext;
-  definition: string;
-  definitionPath: string;
-  modelId: string;
-}): string {
-  const { seat, ctx, definition, definitionPath, modelId } = params;
+function renderSeatSystemPrompt(params: { seat: Seat; definition: string }): string {
+  const { seat, definition } = params;
+  return [
+    `<seat name="${seat}">`,
+    "<!-- Verbatim from this run's pinned engine tree (ALI-104). Project-scope",
+    "     .claude/** discovery is suppressed for this session, so nothing in the",
+    "     working tree can add to, override, or hook these instructions. -->",
+    definition.trimEnd(),
+    "</seat>",
+  ].join("\n");
+}
+
+/**
+ * The work prompt: what to do, and how to report. Travels on stdin.
+ *
+ * Order is a trust boundary, not formatting. Instructions arrive through
+ * `--system-prompt` (above); the issue's title and body come from Linear and
+ * are lower-trust, so they stay here, enclosed in their own `<issue>` element,
+ * read as the work item rather than as further instructions. That boundary is
+ * currently made of unescaped delimiters — a body containing `</issue>` can
+ * still forge frame structure (S6). Escaping and a per-dispatch envelope nonce
+ * are tracked as a follow-up, deliberately not bundled into this bounce round;
+ * the "exactly one envelope" rule already turns the naive version of that
+ * attack into a loud parse failure rather than a silent clean result.
+ */
+function renderWorkPrompt(params: { ctx: DispatchContext }): string {
+  const { ctx } = params;
   const { issue } = ctx;
   const body = issueBody(issue);
 
   return [
-    `<seat name="${seat}" model="${modelId}">`,
-    `<!-- Read verbatim from this run's pinned engine tree: ${definitionPath}.`,
-    "     Never from the worktree — that tree is mutable and may be the very thing this issue edits. -->",
-    definition.trimEnd(),
-    "</seat>",
-    "",
     `<issue id="${issue.id}" points="${issue.points}" labels="${issue.labels.join(",")}">`,
     `title: ${issue.title}`,
     `predicted files: ${issue.predictedFiles.join(", ") || "(none recorded)"}`,
@@ -580,7 +722,9 @@ function renderPrompt(params: {
     body ? `\n${body.trimEnd()}` : "\n(no issue body recorded)",
     "</issue>",
     "",
-    `<workspace worktree="${ctx.worktreePath}" branch="${ctx.branch}" engine-tree="${ctx.enginePath}" />`,
+    // No engine-tree attribute: the pinned tree's path is deliberately not
+    // disclosed to the child (S3). cwd is the worktree, which the seat needs.
+    `<workspace worktree="${ctx.worktreePath}" branch="${ctx.branch}" />`,
     "",
     "<output-contract>",
     `End your run by printing EXACTLY ONE line of the form:`,
@@ -672,10 +816,13 @@ export function createClaudeCliAgentPort(config: ClaudeCliAgentConfig): AgentPor
 
       const handle = config.runner.spawn({
         command,
-        args: buildSeatArgv(seat, modelId),
+        // The pinned definition governs via --system-prompt, and cwd-rooted
+        // setting sources are suppressed, so the worktree at cwd contributes
+        // no instructions and runs no hooks (property 1's delegated half).
+        args: buildSeatArgv({ modelId, systemPrompt: renderSeatSystemPrompt({ seat, definition }) }),
         cwd: ctx.worktreePath,
         env: buildSeatEnv(envSource),
-        stdin: renderPrompt({ seat, ctx, definition, definitionPath, modelId }),
+        stdin: renderWorkPrompt({ ctx }),
       });
 
       const result = await raceWithTimeout(seat, handle, timeoutMs);
@@ -708,6 +855,11 @@ export function createClaudeCliAgentPort(config: ClaudeCliAgentConfig): AgentPor
  * if the limit fires first. The loser of the race gets a no-op catch attached
  * so a late rejection from a killed child never surfaces as an unhandled
  * rejection and takes the run down.
+ *
+ * `handle.kill()` is wrapped so a throwing implementation cannot escape the
+ * timer callback (S5 nit): an uncaught exception inside `setTimeout` is fatal
+ * to the whole dispatcher process, which would turn "one seat is stuck" into
+ * "the run dies without parking its work".
  */
 async function raceWithTimeout(seat: Seat, handle: ProcessHandle, timeoutMs: number): Promise<ProcessResult> {
   const exited = handle.exited;
@@ -723,9 +875,11 @@ async function raceWithTimeout(seat: Seat, handle: ProcessHandle, timeoutMs: num
         timer = setTimeout(() => {
           try {
             handle.kill();
-          } finally {
-            reject(new SeatDispatchTimeoutError(seat, timeoutMs));
+          } catch {
+            // Reclaiming the child is best-effort; an exception here must never
+            // escape the timer callback (see this function's doc comment).
           }
+          reject(new SeatDispatchTimeoutError(seat, timeoutMs));
         }, timeoutMs);
       }),
     ]);
@@ -738,15 +892,44 @@ async function raceWithTimeout(seat: Seat, handle: ProcessHandle, timeoutMs: num
 // The real process runner
 // ---------------------------------------------------------------------------
 
+/** How long a signalled process group gets to exit on SIGTERM before SIGKILL. */
+export const KILL_GRACE_MS = 2_000;
+
+/**
+ * How long to keep draining stdio after the child itself has exited, before
+ * settling anyway. See `exit`-vs-`close` in this factory's doc comment.
+ */
+export const STDIO_DRAIN_MS = 250;
+
 /**
  * Real adapter for `ProcessRunner`: `node:child_process.spawn`, stdin fed the
- * assembled prompt, stdout/stderr buffered. Not a stub — the whole point of
- * ALI-161 is that a run stops planning perfectly and building nothing.
+ * work prompt, stdout/stderr buffered. Not a stub — the whole point of ALI-161
+ * is that a run stops planning perfectly and building nothing.
  *
- * `shell: false` (the default) is load-bearing: the seat name and model id are
- * validated above, but never handing any of it to a shell removes the
- * question entirely. Output is capped so a runaway seat cannot exhaust the
+ * `shell: false` (the default) is load-bearing: every argv element is a literal
+ * or comes from a frozen table, but never handing any of it to a shell removes
+ * the question entirely. Output is capped so a runaway seat cannot exhaust the
  * dispatcher's memory before the timeout fires.
+ *
+ * Two behaviours here were bounce-round-1 findings (S5), and both matter
+ * specifically because the child is `claude`, which spawns children of its own
+ * (Bash-tool subprocesses, MCP servers, node processes):
+ *
+ *   - **`detached: true` + process-group kill.** SIGKILL to the direct pid
+ *     leaves the grandchildren running, holding the child's environment
+ *     (including its model credential) and a cwd inside the worktree — free to
+ *     keep writing there *after* the run has parked that worktree and opened
+ *     its PR. Commits appearing behind a review, from a run that already ended.
+ *     `detached` makes the child a process-group leader so `kill(-pid)` reaches
+ *     the whole tree; SIGTERM first, then SIGKILL after `KILL_GRACE_MS`, so a
+ *     seat mid-write gets a chance to finish cleanly.
+ *   - **Settle on `exit`, not `close`.** `close` waits for stdio EOF, which a
+ *     grandchild inheriting the pipes can hold open indefinitely — making a
+ *     *finished* seat look timed out, at which point the old `kill()` was a
+ *     no-op (the child had already exited) and the pipe-holder was never
+ *     signalled at all. Resolving on `exit` after a bounded drain reports the
+ *     seat's real outcome; the group kill on the timeout path handles the
+ *     leftovers.
  */
 export function createNodeProcessRunner(maxOutputBytes = 8 * 1024 * 1024): ProcessRunner {
   return {
@@ -755,14 +938,31 @@ export function createNodeProcessRunner(maxOutputBytes = 8 * 1024 * 1024): Proce
         cwd: spec.cwd,
         env: { ...spec.env },
         shell: false,
+        // Own process group, so the whole tree can be signalled at once.
+        detached: true,
         stdio: ["pipe", "pipe", "pipe"],
       });
 
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+      let drainTimer: ReturnType<typeof setTimeout> | undefined;
+
       const exited = new Promise<ProcessResult>((resolve, reject) => {
-        let stdout = "";
-        let stderr = "";
         const append = (current: string, chunk: Buffer): string =>
           current.length >= maxOutputBytes ? current : current + chunk.toString("utf8");
+
+        const settle = (exitCode: number | null): void => {
+          if (settled) return;
+          settled = true;
+          if (drainTimer !== undefined) clearTimeout(drainTimer);
+          // Release the pipes. A grandchild holding the write end would
+          // otherwise keep these read streams — and so the dispatcher's event
+          // loop — alive long after the seat is done.
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+          resolve({ exitCode, stdout, stderr });
+        };
 
         child.stdout?.on("data", (chunk: Buffer) => {
           stdout = append(stdout, chunk);
@@ -771,7 +971,14 @@ export function createNodeProcessRunner(maxOutputBytes = 8 * 1024 * 1024): Proce
           stderr = append(stderr, chunk);
         });
         child.on("error", reject);
-        child.on("close", (code) => resolve({ exitCode: code, stdout, stderr }));
+
+        // The child is gone; give its stdio a bounded moment to flush, then
+        // report regardless of who else is still holding the pipes.
+        child.on("exit", (code) => {
+          drainTimer = setTimeout(() => settle(code), STDIO_DRAIN_MS);
+        });
+        // Pipes closed first (the common case) — report immediately.
+        child.on("close", (code) => settle(code));
       });
 
       child.stdin?.end(spec.stdin);
@@ -779,7 +986,21 @@ export function createNodeProcessRunner(maxOutputBytes = 8 * 1024 * 1024): Proce
       return {
         exited,
         kill() {
-          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+          const { pid } = child;
+          if (pid === undefined) return;
+          // Signal the group (negative pid), not just the leader. ESRCH simply
+          // means it is already gone — a kill is best-effort by nature.
+          const signalGroup = (signal: NodeJS.Signals): void => {
+            try {
+              process.kill(-pid, signal);
+            } catch {
+              /* already dead, or no permission — nothing further to do */
+            }
+          };
+          signalGroup("SIGTERM");
+          const hardKill = setTimeout(() => signalGroup("SIGKILL"), KILL_GRACE_MS);
+          // Never let the grace timer hold the dispatcher's event loop open.
+          hardKill.unref?.();
         },
       };
     },

@@ -23,7 +23,7 @@
  * command that could never actually run.
  */
 
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -34,6 +34,7 @@ import {
   DEFAULT_SEAT_TIMEOUT_MS,
   EngineDefinitionUnreadableError,
   PINNED_MODEL_IDS,
+  PINNED_SETTING_SOURCES,
   SEAT_ENV_ALLOWLIST,
   SEAT_RESULT_SENTINEL,
   SeatDispatchTimeoutError,
@@ -50,6 +51,9 @@ import {
   resultIsSecretFree,
   seatArgFrom,
   seatDefinitionRelativePath,
+  settingSourcesArgFrom,
+  suppressesProjectSettingSources,
+  systemPromptArgFrom,
   type ProcessHandle,
   type ProcessResult,
   type ProcessRunner,
@@ -130,6 +134,15 @@ function envelope(payload: Record<string, unknown>): string {
   return `working…\n${SEAT_RESULT_SENTINEL} ${JSON.stringify(payload)}\n`;
 }
 
+/** Runs `attempt` and returns whatever it threw — fails the test if it resolves. */
+async function port_thrown(attempt: () => Promise<unknown>): Promise<Error> {
+  const outcome = await attempt()
+    .then(() => null)
+    .catch((thrown: unknown) => thrown as Error);
+  if (outcome === null) throw new Error("expected the dispatch to throw, but it resolved");
+  return outcome;
+}
+
 // ---------------------------------------------------------------------------
 // The faithful fake CLI (AC8)
 //
@@ -165,6 +178,24 @@ const KNOWN_MODEL_IDS: ReadonlySet<string> = new Set(PINNED_MODEL_IDS);
 /** Exactly the seat names the real CLI would accept for `--agent` in this engine. */
 const KNOWN_AGENTS: ReadonlySet<string> = new Set<string>(BUILD_SEATS as readonly string[]);
 
+/**
+ * What the real CLI would discover from a project-scope `.claude/**` at cwd.
+ * Round 1's fake modelled the CLI as a pure function of argv + stdin, which is
+ * why it could not go red on S1: the discovery that carries the whole `critical`
+ * risk is a function of the child's **cwd**, not of what the parent assembled.
+ */
+function discoverableProjectConfig(cwd: string): string[] {
+  const found: string[] = [];
+  if (existsSync(join(cwd, ".claude", "settings.json"))) found.push(".claude/settings.json");
+  const agentsDir = join(cwd, ".claude", "agents");
+  if (existsSync(agentsDir)) {
+    for (const entry of readdirSync(agentsDir)) {
+      if (entry.endsWith(".md")) found.push(`.claude/agents/${entry}`);
+    }
+  }
+  return found;
+}
+
 function validateInvocation(spec: ProcessSpec): string | null {
   if (spec.command.trim() === "") return "error: no executable given";
   if (!spec.args.includes("--print")) {
@@ -177,9 +208,46 @@ function validateInvocation(spec: ProcessSpec): string | null {
   }
   if (!KNOWN_MODEL_IDS.has(model)) return `error: unknown model ${JSON.stringify(model)}`;
 
+  const suppressed = suppressesProjectSettingSources(spec.args);
+
+  // Probed on `claude` 2.1.233: with project sources loaded, cwd's own
+  // `.claude/agents/builder.md` is discovered ("Available agents: builder, …")
+  // and governs, and a cwd `.claude/settings.json` SessionStart hook EXECUTES.
+  // With `--setting-sources user`, both stop.
+  //
+  // The real CLI does not refuse in that situation — it silently complies, which
+  // is exactly why the fake must refuse: this rule is the ENGINE's invariant
+  // ("the worktree contributes no instructions") expressed as a hard rejection,
+  // so an invocation the engine must never emit cannot pass green here. It is
+  // the one rule in this fake that is stricter than the real system, and it is
+  // deliberate (bounce round 1, S2).
+  if (!suppressed) {
+    const discoverable = discoverableProjectConfig(spec.cwd);
+    if (discoverable.length > 0) {
+      return (
+        `error: cwd holds project-scope Claude config (${discoverable.join(", ")}) that would govern this ` +
+        "session and could run hooks; pass --setting-sources user to suppress cwd-rooted discovery"
+      );
+    }
+  }
+
   const agent = seatArgFrom(spec.args);
-  if (agent === undefined) return "error: --agent is required";
-  if (!KNOWN_AGENTS.has(agent)) return `error: unknown agent ${JSON.stringify(agent)}`;
+  if (agent !== undefined) {
+    // Under user-only setting sources nothing registers a project agent, so the
+    // real CLI rejects any `--agent <name>` this engine would pass (probed:
+    // "--agent 'zz-nonexistent' not found. Available agents: claude, …" — the
+    // worktree's `builder` is absent from that list). The adapter therefore
+    // emits no `--agent` at all; keeping the rule makes re-introducing it —
+    // the mechanism S1 exploits — a red test rather than a silent regression.
+    if (suppressed || !KNOWN_AGENTS.has(agent)) {
+      return `error: unknown agent ${JSON.stringify(agent)}`;
+    }
+  }
+
+  const systemPrompt = systemPromptArgFrom(spec.args);
+  if (systemPrompt === undefined || systemPrompt.trim() === "") {
+    return "error: --system-prompt is required once project agents are unavailable";
+  }
 
   if (spec.stdin.trim() === "") return "error: empty prompt on stdin";
   return null;
@@ -360,7 +428,13 @@ describe("AC2 (teeth): the model pin is per-seat, not one model for the whole ru
     await port.dispatch("builder", makeCtx({ enginePath, worktreePath, issue: makeIssue({ points: 1 }) }));
     await port.dispatch("security", makeCtx({ enginePath, worktreePath, issue: makeIssue({ points: 5 }) }));
 
-    expect(fake.invocations.map((invocation) => seatArgFrom(invocation.args))).toEqual(["builder", "security"]);
+    // The seat identity moved out of argv with `--agent` (S1): it now travels
+    // inside the governing system prompt, which is where the pinned definition
+    // for that seat lives, so the two records stay attributable.
+    expect(fake.invocations.map((invocation) => systemPromptArgFrom(invocation.args)?.split("\n")[0])).toEqual([
+      '<seat name="builder">',
+      '<seat name="security">',
+    ]);
     expect(fake.invocations.map((invocation) => modelArgFrom(invocation.args))).toEqual([
       TIER_MODEL_IDS.haiku,
       TIER_MODEL_IDS.opus,
@@ -390,33 +464,131 @@ describe("AC2 (teeth): the model pin is per-seat, not one model for the whole ru
 // ---------------------------------------------------------------------------
 
 describe("AC3 (teeth): the seat definition is read from enginePath, never from the worktree", () => {
-  it("assembles the prompt from the enginePath copy when both trees hold the file", async () => {
+  it("supplies the enginePath copy as the GOVERNING system prompt when both trees hold the file", async () => {
     const { enginePath, worktreePath } = await makeTrees();
     const fake = createFakeClaudeCli();
     const port = makePort(fake);
 
     await port.dispatch("builder", makeCtx({ enginePath, worktreePath }));
 
-    const prompt = fake.invocations[0].stdin;
-    expect(prompt).toContain(ENGINE_MARKER);
-    // The falsifier: the worktree's copy of the same path says something else.
-    // An adapter that discovered `.claude/**` from cwd would land here.
-    expect(prompt).not.toContain(WORKTREE_MARKER);
+    // Round 1 asserted this against stdin, where the text was only user prose
+    // while the worktree's copy governed (S1). The assertion belongs on the
+    // channel probed to actually govern the session.
+    const systemPrompt = systemPromptArgFrom(fake.invocations[0].args);
+    expect(systemPrompt).toContain(ENGINE_MARKER);
+    expect(systemPrompt).not.toContain(WORKTREE_MARKER);
+    expect(fake.invocations[0].stdin).not.toContain(WORKTREE_MARKER);
   });
 
-  it("keeps reading from the pin even after the worktree's copy is rewritten mid-run", async () => {
+  it("suppresses the child's cwd-rooted .claude/** discovery", async () => {
+    const { enginePath, worktreePath } = await makeTrees();
+    const fake = createFakeClaudeCli();
+    const port = makePort(fake);
+
+    await port.dispatch("builder", makeCtx({ enginePath, worktreePath }));
+
+    const { args } = fake.invocations[0];
+    // The load-bearing half S1 named: reading the right file in the parent is
+    // worthless if the child re-discovers `.claude/**` from cwd = the worktree.
+    expect(suppressesProjectSettingSources(args)).toBe(true);
+    expect(settingSourcesArgFrom(args)).toBe(PINNED_SETTING_SOURCES);
+    expect(settingSourcesArgFrom(args)).not.toMatch(/project|local/);
+  });
+
+  it("passes no --agent, whose resolution is rooted at the mutable worktree", async () => {
+    const { enginePath, worktreePath } = await makeTrees();
+    const fake = createFakeClaudeCli();
+    const port = makePort(fake);
+
+    await port.dispatch("builder", makeCtx({ enginePath, worktreePath }));
+
+    // `--agent <seat>` is not a label: it asks the child to resolve that name
+    // through the discovery hierarchy this adapter closes off. It was round 1's
+    // mechanism for S1.
+    expect(seatArgFrom(fake.invocations[0].args)).toBeUndefined();
+    expect(fake.invocations[0].args).not.toContain("--agent");
+  });
+
+  it("keeps the pin governing even after the worktree's copy is rewritten mid-run", async () => {
     const { enginePath, worktreePath } = await makeTrees();
     const fake = createFakeClaudeCli();
     const port = makePort(fake);
 
     // Exactly the seed-repo scenario docs/ENGINE.md §16 names: a builder issue
-    // legitimately editing `.claude/**` as its actual work.
+    // legitimately editing `.claude/**` as its actual work — and, per S1, the
+    // reviewer and security seats then run in that same worktree.
     await writeDefinition(worktreePath, "builder", "SELF-MODIFIED-MID-RUN");
+    await writeDefinition(worktreePath, "security", "SELF-MODIFIED-MID-RUN");
+
+    for (const seat of BUILD_SEATS) {
+      await port.dispatch(seat, makeCtx({ enginePath, worktreePath }));
+    }
+
+    for (const invocation of fake.invocations) {
+      expect(systemPromptArgFrom(invocation.args)).toContain(ENGINE_MARKER);
+      expect(systemPromptArgFrom(invocation.args)).not.toContain("SELF-MODIFIED-MID-RUN");
+      expect(suppressesProjectSettingSources(invocation.args)).toBe(true);
+    }
+    expect(fake.rejections).toEqual([]);
+  });
+
+  it("a worktree .claude/settings.json cannot govern or hook the session", async () => {
+    const { enginePath, worktreePath } = await makeTrees();
+    // Probed on the real CLI: a SessionStart command hook here EXECUTES with
+    // project sources loaded, and does not with --setting-sources user.
+    await fs.writeFile(
+      join(worktreePath, ".claude", "settings.json"),
+      JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: "touch /tmp/pwned" }] }] } }),
+      "utf8",
+    );
+    const fake = createFakeClaudeCli();
+    const port = makePort(fake);
+
+    const result = await port.dispatch("builder", makeCtx({ enginePath, worktreePath }));
+
+    // Accepted by the fake precisely because the invocation suppresses the
+    // scope that would have run the hook.
+    expect(result.summary).toContain("ok");
+    expect(fake.rejections).toEqual([]);
+    expect(suppressesProjectSettingSources(fake.invocations[0].args)).toBe(true);
+  });
+
+  it("the fake goes RED if suppression is ever dropped (S1 regression guard)", async () => {
+    const { worktreePath } = await makeTrees();
+    const fake = createFakeClaudeCli();
+
+    // Round 1's exact invocation shape, replayed by hand: no suppression, cwd
+    // holding a discoverable `.claude/agents/builder.md`.
+    const handle = fake.runner.spawn({
+      command: "claude",
+      args: ["--print", "--model", TIER_MODEL_IDS.sonnet, "--agent", "builder", "--system-prompt", "pinned text"],
+      cwd: worktreePath,
+      env: {},
+      stdin: "work prompt",
+    });
+    const outcome = await handle.exited;
+
+    expect(outcome.exitCode).not.toBe(0);
+    expect(outcome.stderr).toMatch(/project-scope Claude config|--setting-sources user/);
+    expect(fake.rejections).toHaveLength(1);
+    expect(fake.invocations).toEqual([]);
+  });
+
+  it("does not disclose the pinned tree's path to the child (S3)", async () => {
+    const { enginePath, worktreePath } = await makeTrees();
+    const fake = createFakeClaudeCli();
+    const port = makePort(fake);
 
     await port.dispatch("builder", makeCtx({ enginePath, worktreePath }));
 
-    expect(fake.invocations[0].stdin).toContain(ENGINE_MARKER);
-    expect(fake.invocations[0].stdin).not.toContain("SELF-MODIFIED-MID-RUN");
+    const { stdin, args } = fake.invocations[0];
+    // The pinned tree is writable by the same uid; naming it invites a seat to
+    // edit the definitions a later seat in the same run reads.
+    expect(stdin).not.toContain(enginePath);
+    expect(stdin).not.toContain("engine-tree");
+    expect(args.join(" ")).not.toContain(enginePath);
+    // cwd is still the worktree (AC4) — discovery is what got cut, not the cwd.
+    expect(fake.invocations[0].cwd).toBe(worktreePath);
   });
 
   it("throws when enginePath does not exist — and never falls back to the worktree", async () => {
@@ -762,6 +934,55 @@ describe("AC7: secrets never reach the record, and the child env carries only wh
     }
   });
 
+  it("scrubs secrets out of EVERY named error this adapter can throw (S4)", async () => {
+    const { enginePath, worktreePath } = await makeTrees();
+
+    // Round 1 leaked here: a V8 JSON.parse message quotes ~10-20 chars around
+    // the offending token, and the unknown-key path echoed the whole key —
+    // `containsSecretLike()` was true on both. A throw is a record path too.
+    const parseErrorInputs: readonly string[] = [
+      `${SEAT_RESULT_SENTINEL} ghp_AAAABBBBCCCCDDDDEEEE\n`,
+      `${SEAT_RESULT_SENTINEL} {"summary":"a","lin_api_deadbeefdeadbeef":1}\n`,
+      `${SEAT_RESULT_SENTINEL} {"summary":"a","ambiguous":{"sk-ABCDEF123456":"x"}}\n`,
+      `${SEAT_RESULT_SENTINEL} {"summary":"a","model":"github_pat_11ABCDE0000"}\n`,
+    ];
+
+    for (const stdout of parseErrorInputs) {
+      const fake = createFakeClaudeCli(() => ({ stdout }));
+      const port = makePort(fake);
+      const error = await port
+        .dispatch("builder", makeCtx({ enginePath, worktreePath }))
+        .then(() => null)
+        .catch((thrown: unknown) => thrown as Error);
+
+      expect(error).toBeInstanceOf(SeatOutputParseError);
+      expect(containsSecretLike((error as Error).message)).toBe(false);
+    }
+
+    // The other named errors, each constructed with secret-shaped input.
+    const unknownSeat = await port_thrown(() =>
+      makePort(createFakeClaudeCli()).dispatch("ghp_AAAABBBB" as unknown as Seat, makeCtx({ enginePath, worktreePath })),
+    );
+    expect(unknownSeat).toBeInstanceOf(UnknownSeatError);
+    expect(containsSecretLike(unknownSeat.message)).toBe(false);
+
+    const unreadable = await port_thrown(() =>
+      makePort(createFakeClaudeCli()).dispatch(
+        "builder",
+        makeCtx({ enginePath: join(enginePath, "lin_api_missingtree"), worktreePath }),
+      ),
+    );
+    expect(unreadable).toBeInstanceOf(EngineDefinitionUnreadableError);
+    expect(containsSecretLike(unreadable.message)).toBe(false);
+
+    const failedFake = createFakeClaudeCli(() => ({ exitCode: 1, stdout: "", stderr: "token sk-LEAKED123456" }));
+    const failed = await port_thrown(() =>
+      makePort(failedFake).dispatch("builder", makeCtx({ enginePath, worktreePath })),
+    );
+    expect(failed).toBeInstanceOf(SeatProcessFailedError);
+    expect(containsSecretLike(failed.message)).toBe(false);
+  });
+
   it("buildSeatEnv is an allowlist projection, not a denylist", () => {
     const projected = buildSeatEnv({ PATH: "/bin", NEW_SECRET_ADDED_LATER: "x", TZ: undefined });
     expect(projected).toEqual({ PATH: "/bin" });
@@ -902,20 +1123,34 @@ describe("createNodeProcessRunner (real subprocess, no claude CLI involved)", ()
     return path;
   }
 
-  it("delivers the prompt on stdin and parses a real child's envelope", async () => {
+  /** Signal 0 probes liveness without delivering anything. */
+  function isAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("delivers both channels to a real child — pinned definition on argv, work prompt on stdin", async () => {
     const { enginePath, worktreePath } = await makeTrees();
-    // A stand-in "seat": ignores the argv it is handed (`--print --model … `
-    // `--agent builder`), reads the prompt on stdin, and answers with the
-    // result envelope — exactly the contract the real CLI is invoked under.
+    // A stand-in "seat": checks it received the pinned definition as its system
+    // prompt (argv) and the work prompt on stdin, then answers with the result
+    // envelope — the two-channel contract the real CLI is invoked under.
     const script = await writeScript(
       worktreePath,
       "seat.sh",
       [
         "#!/bin/sh",
-        `if grep -q '${ENGINE_MARKER}'; then`,
-        `  echo '${SEAT_RESULT_SENTINEL} {"summary":"real subprocess saw the pinned definition"}'`,
+        'argv="$*"',
+        "stdin=$(cat)",
+        `case "$argv" in *${ENGINE_MARKER}*) sys=yes ;; *) sys=no ;; esac`,
+        'case "$stdin" in *ALI-REAL-RUN*) work=yes ;; *) work=no ;; esac',
+        'if [ "$sys" = yes ] && [ "$work" = yes ]; then',
+        `  echo '${SEAT_RESULT_SENTINEL} {"summary":"real subprocess: pinned system prompt + work prompt"}'`,
         "else",
-        `  echo '${SEAT_RESULT_SENTINEL} {"summary":"MISSING DEFINITION"}'`,
+        `  echo '${SEAT_RESULT_SENTINEL} {"summary":"MISSING CHANNEL sys='"$sys"' work='"$work"'"}'`,
         "fi",
       ].join("\n"),
     );
@@ -928,30 +1163,102 @@ describe("createNodeProcessRunner (real subprocess, no claude CLI involved)", ()
       envSource: process.env,
     });
 
-    const result = await port.dispatch("builder", makeCtx({ enginePath, worktreePath }));
+    const result = await port.dispatch(
+      "builder",
+      makeCtx({ enginePath, worktreePath, issue: makeIssue({ id: "ALI-REAL-RUN" }) }),
+    );
 
-    expect(result.summary).toBe("real subprocess saw the pinned definition");
+    expect(result.summary).toBe("real subprocess: pinned system prompt + work prompt");
   }, 30_000);
 
-  it("kills a real hung child when asked", async () => {
+  it("kills the whole process GROUP, not just the direct child (S5)", async () => {
     const { worktreePath } = await makeTrees();
-    const script = await writeScript(worktreePath, "hang.cjs", "setInterval(() => {}, 1000);\n");
+    // The seat's own children — `claude` spawns Bash-tool subprocesses and MCP
+    // servers — are what survived a single-pid SIGKILL in round 1: orphans
+    // holding the child's credential-bearing env and a cwd inside a worktree
+    // the run has already parked.
+    const pidFile = join(worktreePath, "grandchild.pid");
+    const script = await writeScript(
+      worktreePath,
+      "spawner.sh",
+      ["#!/bin/sh", "sleep 300 &", `echo $! > ${pidFile}`, "sleep 300"].join("\n"),
+    );
+    await fs.chmod(script, 0o755);
 
     const runner = createNodeProcessRunner();
     const handle = runner.spawn({
-      command: process.execPath,
-      args: [script],
+      command: script,
+      args: [],
       cwd: worktreePath,
       env: buildSeatEnv(process.env),
       stdin: "",
     });
 
-    handle.kill();
-    const result = await handle.exited;
+    // Wait for the grandchild to exist.
+    let grandchildPid = 0;
+    for (let attempt = 0; attempt < 100 && grandchildPid === 0; attempt++) {
+      try {
+        grandchildPid = Number.parseInt(await fs.readFile(pidFile, "utf8"), 10) || 0;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    expect(grandchildPid).toBeGreaterThan(0);
+    expect(isAlive(grandchildPid)).toBe(true);
 
-    // Killed by signal rather than exiting on its own — the timeout path's
-    // `handle.kill()` therefore genuinely reclaims a stuck seat.
-    expect(result.exitCode).toBeNull();
+    handle.kill();
+    await handle.exited;
+
+    // Give the group signal a moment to land on the grandchild.
+    for (let attempt = 0; attempt < 100 && isAlive(grandchildPid); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect(isAlive(grandchildPid)).toBe(false);
+  }, 30_000);
+
+  it("settles on the child's exit even while a grandchild holds the pipes open (S5)", async () => {
+    const { enginePath, worktreePath } = await makeTrees();
+    // `close` waits for stdio EOF, which an inheriting grandchild can hold for
+    // as long as it likes — reporting a FINISHED seat as timed out, at which
+    // point round 1's kill() was a no-op because the direct child had already
+    // exited, so the pipe holder was never signalled at all.
+    const pidFile = join(worktreePath, "pipe-holder.pid");
+    const script = await writeScript(
+      worktreePath,
+      "leaky.sh",
+      [
+        "#!/bin/sh",
+        "sleep 30 &",
+        `echo $! > ${pidFile}`,
+        `echo '${SEAT_RESULT_SENTINEL} {"summary":"finished despite a pipe holder"}'`,
+      ].join("\n"),
+    );
+    await fs.chmod(script, 0o755);
+
+    const port = createClaudeCliAgentPort({
+      runner: createNodeProcessRunner(),
+      command: script,
+      // Well below the pipe holder's 30s lifetime: an implementation that waited
+      // for `close` would blow this limit and report a timeout for a seat that
+      // finished in milliseconds.
+      timeoutMs: 3_000,
+      envSource: process.env,
+    });
+
+    const startedAt = Date.now();
+    const result = await port.dispatch("builder", makeCtx({ enginePath, worktreePath }));
+    const elapsed = Date.now() - startedAt;
+
+    expect(result.summary).toBe("finished despite a pipe holder");
+    expect(elapsed).toBeLessThan(3_000);
+
+    // Don't leave the pipe holder behind for the rest of the suite.
+    try {
+      const holder = Number.parseInt(await fs.readFile(pidFile, "utf8"), 10);
+      if (holder > 0) process.kill(holder, "SIGKILL");
+    } catch {
+      /* already gone */
+    }
   }, 30_000);
 });
 
@@ -977,7 +1284,11 @@ describe("prompt assembly", () => {
     expect(prompt).toContain("explicit model argument");
     expect(prompt).toContain(SEAT_RESULT_SENTINEL);
     expect(prompt).toContain(worktreePath);
-    expect(prompt).toContain(enginePath);
+    // The pinned tree's path is deliberately NOT here (S3), and the seat's
+    // instructions are not here either — they govern via --system-prompt (S1).
+    expect(prompt).not.toContain(enginePath);
+    expect(prompt).not.toContain(ENGINE_MARKER);
+    expect(systemPromptArgFrom(fake.invocations[0].args)).toContain(ENGINE_MARKER);
   });
 
   it("tolerates an issue with no body (the pure `Issue` shape the pipeline is typed against)", async () => {
