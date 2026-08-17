@@ -38,6 +38,10 @@ Groom Backlog (stale issues, broken dependencies, duplicates). Suggest Triage→
 
 1. **Nominate** Backlog issues for the next cycle (priority, dependency order, Pedro's stated intent). Nomination triggers the spec pass — nominate before composing so Pedro approves pointed, spec'd issues.
 2. **Cluster by files, not similarity**: issues touching the same files → one routine, sequential. Different files → parallel routines if big, batched into one routine if small. Only independent issues parallelize.
-3. **Compose the proposal**: the Ready nominees, their points total vs. measured velocity, the clustering plan, and anything flagged unready. Send via the escalation channel for one-tap approval.
+3. **Compose the proposal**: the Ready nominees, their points total vs. measured velocity, the clustering plan, anything flagged unready — and, **required, never blank (ALI-170)**, one line stating what a user will be able to do after this cycle that they could not do today. Exactly two forms are permitted:
+   - **(a) a capability sentence in the user's voice** — e.g. *"A visitor to pedroestevez.com can book an interview slot with Pedro and receive a calendar invite."*
+   - **(b) an explicit no-release statement plus what the cycle bought instead** — e.g. `no user-visible release — engine/infrastructure cycle: real AgentPort adapter landed for the build seats, closing the simulated-dispatch gap.`
+
+   "None, because—" is a valid answer under form (b); an omitted line is not. Send via the escalation channel for one-tap approval.
 
 **Nothing you compose executes until Pedro approves the cycle.** You propose; the Direction gate disposes.
