@@ -289,3 +289,34 @@ This is no longer aspirational one layer down, either: the **per-project** dispa
 ## 18. Horizon — one surface, many products
 
 End state: as products are added, the master dispatcher runs approved cycles across all repos in parallel, and Pedro's whole job stays the surface in §15 — feed backlogs, tap approvals, answer escalations. One engine, many products, simultaneous. Every v1 interface above (per-project run endpoints, cycle proposals over the escalation channel, scoped creds per repo) is already shaped for it.
+
+---
+
+## 19. Definition of done — the standing bar
+
+Scrum has this right and the engine had it inverted: **DoD is standing and team-wide; acceptance criteria are per-item.** Every issue's own `## Definition of done` field is a **citation of this section**, never a restatement — it names only what is specific to that issue (which criterion is load-bearing, an issue-specific demonstration). An issue whose Definition of Done re-lists the clauses below has restated the standing bar, which is the exact drift this section exists to stop: before this section existed, `ALI-98`'s dual-repo rule and `ALI-134`'s evidence bar each accumulated their own slightly different wording, copied issue to issue.
+
+**Enumerated by build-time survey, not transcribed from memory** (ALI-169, gate 8 applied to itself): every distinct `## Definition of done` section body across the issues in the Development Engine Seed Linear project was read via `list_issues`/`get_issue` (query, project scope, and timestamp recorded in the PR body that introduced this section), and every clause that recurred in at least three of them was kept. What follows is that result, not a list remembered from prior issue bodies:
+
+1. **All acceptance criteria are met.**
+2. **The load-bearing criterion (or criteria) is named, and satisfying it is demonstrated — not merely asserted, described, or left to inspection.** A red/failing case shown before the fix and green after; an actual run, not a simulation; a fixture exercised, not just described.
+3. **Tests pass and CI is green.**
+4. **For any change touching an engine file, the PR merges through the Amendment gate (§16) — only Pedro merges.**
+
+This is a **build-time enumeration, not a fixed list.** The next re-derivation (re-run the same query against the then-current corpus) may add or retire a clause. What must never happen is an item-specific clause creeping in here: anything true of only one issue belongs in that issue's own acceptance criteria, never in this section.
+
+Clause 2's evidence bar is the same discipline gate 8 (`spec.md`) applies to procedural literals in acceptance criteria: a claim about what was done is only as good as what backs it. Where a criterion needs a pinned literal, it carries gate 8's `SOURCE` / `READ AT` / `LITERAL` evidence-block grammar (defined in `spec.md`) — the same grammar ALI-149's `ASSUMES` / `PROBE` / `OUTPUT` / `RUN AT` block, once it lands, **instantiates rather than duplicates.** No second evidence-block grammar exists anywhere in this repo.
+
+---
+
+## 20. Gate 9 — context fit and the decomposition dial
+
+Decided by Pedro at the Direction gate, 2026-08-17 (ALI-169, recorded on ALI-154). This **supersedes** a hard 2-point cap an earlier revision floated, which Pedro rejected: story points are a **relative** size scale, and forcing every item small destroys the very signal the calibration loop (§9) exists to measure. The binding constraint was never the point value. It is **context**: whether one agent has room for the task *plus* the briefing that task needs.
+
+**9a — Context-fit test (qualitative, applied at spec time).** A Ready item must fit inside one agent's context window: the work itself, plus the briefing required to do it. **Parallelism buys throughput across items, never depth within one** — ten agents is ten separate windows, not one large one.
+
+> This clause's wording is shared verbatim with any later section stating the same context-capacity rule (e.g. ALI-170's context-capacity clause) — whichever lands second must cite this wording rather than restate it, or the two have drifted on the day they landed.
+
+**9b — Decomposition dial (quantitative — a dial, not a constant).** Initial setting: **5-point items** must be decomposed into sub-issues or carry an explicit **atomicity justification**; **1–3 points are buildable as-is**. Every retro re-sets the dial from §9's calibration data — bounce rate and cost by estimate — and must **cite the evidence when it moves it** (the shape of the reasoning being *"agents handled 3s but not 8s → adjust"*). The dial exists precisely because this is a **measurement, not a doctrine**.
+
+**Interaction with the budget gate (§4, `spec.md`).** Different instruments; both apply. Budget is `points × danger-multiplier ≤ run budget`, so a 3-point danger-labelled item (weighted 6) is already refused while a 3-point clean item (weighted 3) passes. 9b bites on **size independent of risk**; 9a bites on **shape**, which neither the budget gate nor 9b alone can see.
