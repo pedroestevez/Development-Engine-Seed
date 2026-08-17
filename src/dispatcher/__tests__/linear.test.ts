@@ -19,6 +19,8 @@
  * silently passes.
  */
 
+import { inspect } from "node:util";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -195,7 +197,7 @@ function graphqlErrors(messages: string[]): HttpResponseLike {
   return jsonResponse(200, { data: null, errors: messages.map((message) => ({ message })) });
 }
 
-function issueNode(issue: FakeIssue): Record<string, unknown> {
+function issueNode(issue: FakeIssue, nestedPageSize = 50): Record<string, unknown> {
   return {
     identifier: issue.identifier,
     title: issue.title,
@@ -205,9 +207,18 @@ function issueNode(issue: FakeIssue): Record<string, unknown> {
     state: { name: issue.stateName },
     cycle: issue.cycleId === null ? null : { id: issue.cycleId },
     team: { id: issue.teamId },
-    labels: { nodes: issue.labels.map((name) => ({ name })) },
+    // Real Linear always returns `pageInfo` on a connection (it is non-null in
+    // the schema), so the faithful fake does too — and reports truncation
+    // honestly when the world holds more rows than the page asked for.
+    labels: {
+      nodes: issue.labels.slice(0, nestedPageSize).map((name) => ({ name })),
+      pageInfo: { hasNextPage: issue.labels.length > nestedPageSize },
+    },
     inverseRelations: {
-      nodes: issue.blockedBy.map((blocker) => ({ type: "blocks", issue: { identifier: blocker } })),
+      nodes: issue.blockedBy
+        .slice(0, nestedPageSize)
+        .map((blocker) => ({ type: "blocks", issue: { identifier: blocker } })),
+      pageInfo: { hasNextPage: issue.blockedBy.length > nestedPageSize },
     },
   };
 }
@@ -315,7 +326,7 @@ function createFakeLinear(world: FakeWorld): { fetchImpl: FetchLike; calls: Reco
         data: {
           cycle: { id: cycleId },
           issues: {
-            nodes: page.map(issueNode),
+            nodes: page.map((issue) => issueNode(issue)),
             pageInfo: {
               hasNextPage: nextIndex < matching.length,
               endCursor: nextIndex < matching.length ? String(nextIndex) : null,
@@ -606,13 +617,14 @@ describe("AC3: each returned issue maps to LinearIssue with every field populate
       state: { name: "Ready" },
       cycle: { id: CYCLE_ID },
       team: { id: TEAM_ID },
-      labels: { nodes: [] },
+      labels: { nodes: [], pageInfo: { hasNextPage: false } },
       inverseRelations: {
         nodes: [
           { type: "blocks", issue: { identifier: "ALI-100" } },
           { type: "related", issue: { identifier: "ALI-999" } },
           { type: "duplicate", issue: { identifier: "ALI-888" } },
         ],
+        pageInfo: { hasNextPage: false },
       },
     });
     expect(mapped.blockedBy).toEqual(["ALI-100"]);
@@ -629,10 +641,10 @@ describe("AC3: each returned issue maps to LinearIssue with every field populate
         state: { name: "Ready" },
         cycle: { id: CYCLE_ID },
         team: { id: TEAM_ID },
-        labels: { nodes: [] },
-        inverseRelations: { nodes: [] },
+        labels: { nodes: [], pageInfo: { hasNextPage: false } },
+        inverseRelations: { nodes: [], pageInfo: { hasNextPage: false } },
       }),
-    ).toThrow(/ALI-302: is in state Ready with no numeric `estimate`/);
+    ).toThrow(/ALI-302: is in state Ready with estimate null/);
   });
 
   it("fails loud rather than assuming an empty label list (labels drive the risk tier)", () => {
@@ -646,7 +658,7 @@ describe("AC3: each returned issue maps to LinearIssue with every field populate
         state: { name: "Ready" },
         cycle: { id: CYCLE_ID },
         team: { id: TEAM_ID },
-        inverseRelations: { nodes: [] },
+        inverseRelations: { nodes: [], pageInfo: { hasNextPage: false } },
       }),
     ).toThrow(/ALI-303: Linear returned no `labels` connection/);
   });
@@ -1076,6 +1088,278 @@ describe("AC8: getApprovedCycle, setIssueStatus, addComment and postCycleSummary
     await real.getWorkflowStatuses();
     await real.getReadyIssuesInCycle(CYCLE_ID);
     expect(calls).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Security pass, round 1 (S1–S7). S1 was blocking: a nested connection that
+// truncated at the page cap was undetectable, so a danger label past row 50
+// mapped to riskTier "none" and skipped the mandatory security pass.
+// ---------------------------------------------------------------------------
+
+/** One issue node, served straight back, so a nested-connection shape can be aimed at the mapper. */
+function singleIssueResponse(node: Record<string, unknown>): HttpResponseLike {
+  return jsonResponse(200, {
+    data: {
+      cycle: { id: CYCLE_ID },
+      issues: { nodes: [node], pageInfo: { hasNextPage: false, endCursor: null } },
+    },
+  });
+}
+
+describe("S1 (blocking): a truncated nested connection fails loud, never maps a partial set", () => {
+  it("labels: hasNextPage true throws, naming the skipped security pass as the consequence", async () => {
+    const truncated = issueNode(fakeIssue({ identifier: "ALI-910", labels: ["area/a", "external-api"] }), 1);
+    const port = portWithTransport(respondWith(singleIssueResponse(truncated)).fetchImpl);
+
+    await expect(port.getReadyIssuesInCycle(CYCLE_ID)).rejects.toThrow(
+      /ALI-910: the `labels` connection is TRUNCATED/,
+    );
+    await expect(port.getReadyIssuesInCycle(CYCLE_ID)).rejects.toThrow(/mandatory security pass/);
+  });
+
+  it("a danger label beyond the page cap can never map to a risk-free label set", async () => {
+    // The probed failure: `external-api` sits past the cap, riskTier drops to
+    // "none", the tier drops off its floor, the security pass is skipped. The
+    // adapter must refuse the issue outright rather than return it carrying a
+    // label set that silently lost the danger label.
+    const truncated = issueNode(fakeIssue({ identifier: "ALI-911", labels: ["area/a", "external-api"] }), 1);
+    const port = portWithTransport(respondWith(singleIssueResponse(truncated)).fetchImpl);
+
+    const error = await port.getReadyIssuesInCycle(CYCLE_ID).then(
+      (issues) => {
+        throw new Error(`expected a rejection, got labels ${JSON.stringify(issues.map((i) => i.labels))}`);
+      },
+      (caught: unknown) => caught as Error,
+    );
+    expect(error).toBeInstanceOf(LinearApiError);
+  });
+
+  it("inverseRelations: hasNextPage true throws, naming the invisible blocker as the consequence", async () => {
+    const truncated = issueNode(fakeIssue({ identifier: "ALI-912", blockedBy: ["ALI-1", "ALI-2"] }), 1);
+    const port = portWithTransport(respondWith(singleIssueResponse(truncated)).fetchImpl);
+
+    await expect(port.getReadyIssuesInCycle(CYCLE_ID)).rejects.toThrow(
+      /ALI-912: the `inverseRelations` connection is TRUNCATED/,
+    );
+    await expect(port.getReadyIssuesInCycle(CYCLE_ID)).rejects.toThrow(/invisible to plan\.ts's admit\(\)/);
+  });
+
+  it("a nested connection with NO pageInfo throws too — 'cannot tell' fails like 'yes'", async () => {
+    const node = issueNode(fakeIssue({ identifier: "ALI-913" }));
+    delete (node.labels as Record<string, unknown>).pageInfo;
+    const port = portWithTransport(respondWith(singleIssueResponse(node)).fetchImpl);
+
+    await expect(port.getReadyIssuesInCycle(CYCLE_ID)).rejects.toThrow(
+      /ALI-913: Linear returned no usable `pageInfo` on the `labels` connection/,
+    );
+  });
+
+  it("a COMPLETE nested connection still maps normally — the guard is about truncation, not labels", async () => {
+    const { port } = portFor(
+      defineFakeWorld({
+        issues: [fakeIssue({ identifier: "ALI-914", labels: ["external-api", "pipeline"], blockedBy: ["ALI-9"] })],
+      }),
+    );
+    const [issue] = await port.getReadyIssuesInCycle(CYCLE_ID);
+    expect(issue.labels).toEqual(["external-api", "pipeline"]);
+    expect(issue.blockedBy).toEqual(["ALI-9"]);
+  });
+
+  it("the query actually asks for pageInfo on both nested connections", async () => {
+    const { port, calls } = portFor(defineFakeWorld({ issues: [fakeIssue({ identifier: "ALI-915" })] }));
+    await port.getReadyIssuesInCycle(CYCLE_ID);
+    const query = calls[0].query;
+    expect(query).toMatch(/labels\(first: \d+\) \{ nodes \{ name \} pageInfo \{ hasNextPage \} \}/);
+    expect(query).toMatch(/inverseRelations\(first: \d+\)[\s\S]*?pageInfo \{ hasNextPage \}/);
+  });
+});
+
+describe("S2: credential value-redaction covers EVERY error path, not just the transport", () => {
+  // A key with no known prefix — `scrubSecrets()` cannot see it, so only
+  // value-redaction can. ALI-156 may well require exactly this shape.
+  const OAUTHISH = "oauthtok_ZZZ9988776655443322";
+
+  it("a non-prefixed credential pasted into an issue BODY is redacted in the parse error", async () => {
+    const body = [`## ${PREDICTED_FILES_HEADING}`, "", `oops pasted ${OAUTHISH} in here`, ""].join("\n");
+    const leaky = issueNode(fakeIssue({ identifier: "ALI-920", description: body }));
+    const port = createLinearApiPort({
+      apiKey: OAUTHISH,
+      teamId: TEAM_ID,
+      endpoint: FAKE_ENDPOINT,
+      sleep: async () => {},
+      fetchImpl: respondWith(singleIssueResponse(leaky)).fetchImpl,
+    });
+
+    const error = await port.getReadyIssuesInCycle(CYCLE_ID).then(
+      () => {
+        throw new Error("expected a rejection");
+      },
+      (caught: unknown) => caught as Error,
+    );
+    expect(error.message).toContain("[REDACTED]");
+    expect(error.message).not.toContain(OAUTHISH);
+  });
+
+  it("a non-prefixed credential arriving via `identifier` is redacted in a mapping error", async () => {
+    const node = issueNode(fakeIssue({ identifier: `ALI-${OAUTHISH}` }));
+    delete (node as Record<string, unknown>).labels;
+    const port = createLinearApiPort({
+      apiKey: OAUTHISH,
+      teamId: TEAM_ID,
+      endpoint: FAKE_ENDPOINT,
+      sleep: async () => {},
+      fetchImpl: respondWith(singleIssueResponse(node)).fetchImpl,
+    });
+
+    const error = await port.getReadyIssuesInCycle(CYCLE_ID).then(
+      () => {
+        throw new Error("expected a rejection");
+      },
+      (caught: unknown) => caught as Error,
+    );
+    expect(error.message).toContain("labels");
+    expect(error.message).not.toContain(OAUTHISH);
+  });
+});
+
+describe("S3: the cause chain is sanitized too, not just the message", () => {
+  it("a transport error whose cause echoes the credential leaks nothing through `cause`", async () => {
+    const key = "oauthtok_CAUSECHAIN99887766";
+    const port = createLinearApiPort({
+      apiKey: key,
+      teamId: TEAM_ID,
+      endpoint: FAKE_ENDPOINT,
+      sleep: async () => {},
+      fetchImpl: async () => {
+        throw new Error(`socket died with ${key}`);
+      },
+    });
+
+    const error = await port.getWorkflowStatuses().then(
+      () => {
+        throw new Error("expected a rejection");
+      },
+      (caught: unknown) => caught as Error,
+    );
+
+    expect(error.message).not.toContain(key);
+    const cause = error.cause as Error | undefined;
+    expect(cause).toBeInstanceOf(Error);
+    expect(cause?.message).not.toContain(key);
+    expect(cause?.stack ?? "").not.toContain(key);
+    // Whole-object inspection is what an unattended run's default handler prints.
+    expect(inspect(error, { depth: 5 })).not.toContain(key);
+  });
+
+  it("keeps the cause's diagnostic name, so sanitizing does not cost debuggability", async () => {
+    const port = portWithTransport(async () => {
+      throw new TypeError("fetch failed");
+    });
+    const error = await port.getWorkflowStatuses().then(
+      () => {
+        throw new Error("expected a rejection");
+      },
+      (caught: unknown) => caught as Error,
+    );
+    expect((error.cause as Error).name).toBe("TypeError");
+    expect((error.cause as Error).message).toBe("fetch failed");
+  });
+});
+
+describe("S4: an estimate below the routing table's lowest row is rejected, exactly like null", () => {
+  const nodeWithEstimate = (estimate: unknown) => ({
+    ...issueNode(fakeIssue({ identifier: "ALI-930" })),
+    estimate,
+  });
+
+  it("rejects 0 — a legal Linear estimate that prices work as FREE against the budget gate", () => {
+    expect(() => mapIssueNode(nodeWithEstimate(0))).toThrow(
+      /estimate 0, which is not a finite number of at least 1/,
+    );
+  });
+
+  it("rejects a negative estimate — negative cost ADDS budget headroom", () => {
+    expect(() => mapIssueNode(nodeWithEstimate(-5))).toThrow(/estimate -5/);
+  });
+
+  it("still rejects null, and still accepts a legitimate 1-point estimate", () => {
+    expect(() => mapIssueNode(nodeWithEstimate(null))).toThrow(/estimate null/);
+    expect(mapIssueNode(nodeWithEstimate(1)).points).toBe(1);
+  });
+
+  it("names the reason as the routing table's floor, not an arbitrary rule", () => {
+    expect(() => mapIssueNode(nodeWithEstimate(0))).toThrow(/routing table's lowest row is 1 point/);
+  });
+});
+
+describe("S5: the read gate fails CLOSED on team, at parity with state and cycle", () => {
+  const rowWithTeam = (team: unknown) => {
+    const node = issueNode(fakeIssue({ identifier: "ALI-940" }));
+    if (team === undefined) delete (node as Record<string, unknown>).team;
+    else (node as Record<string, unknown>).team = team;
+    return node;
+  };
+
+  for (const [label, team] of [
+    ["absent", undefined],
+    ["null", null],
+    ["present but id-less", {}],
+    ["another team's id", { id: "team-OTHER" }],
+  ] as Array<[string, unknown]>) {
+    it(`excludes a row whose team is ${label}`, async () => {
+      const port = portWithTransport(respondWith(singleIssueResponse(rowWithTeam(team))).fetchImpl);
+      await expect(port.getReadyIssuesInCycle(CYCLE_ID)).resolves.toEqual([]);
+    });
+  }
+
+  it("admits the row when the team id matches, so the gate is not simply refusing everything", async () => {
+    const port = portWithTransport(respondWith(singleIssueResponse(rowWithTeam({ id: TEAM_ID }))).fetchImpl);
+    const issues = await port.getReadyIssuesInCycle(CYCLE_ID);
+    expect(issues.map((issue) => issue.id)).toEqual(["ALI-940"]);
+  });
+});
+
+describe("S6: a row served on two pages is returned once", () => {
+  it("de-duplicates by identifier rather than relying on plan.ts's id-keyed admit()", async () => {
+    const duplicate = issueNode(fakeIssue({ identifier: "ALI-950" }));
+    const port = portWithTransport(
+      respondWith(
+        jsonResponse(200, {
+          data: {
+            cycle: { id: CYCLE_ID },
+            issues: { nodes: [duplicate], pageInfo: { hasNextPage: true, endCursor: "1" } },
+          },
+        }),
+        jsonResponse(200, {
+          data: {
+            cycle: { id: CYCLE_ID },
+            issues: { nodes: [duplicate], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        }),
+      ).fetchImpl,
+    );
+
+    const issues = await port.getReadyIssuesInCycle(CYCLE_ID);
+    expect(issues.map((issue) => issue.id)).toEqual(["ALI-950"]);
+  });
+});
+
+describe("S7: config ceilings are structural, not left to the caller", () => {
+  it("refuses a credential too short for value-redaction to be meaningful", () => {
+    expect(() => createLinearApiPort({ apiKey: "abc123", teamId: TEAM_ID })).toThrow(/implausibly short/);
+  });
+
+  it("refuses a maxDelayMs above the structural ceiling — it is what caps Retry-After", () => {
+    expect(() =>
+      createLinearApiPort({ apiKey: DUMMY_API_KEY, teamId: TEAM_ID, retry: { maxDelayMs: 3_600_000 } }),
+    ).toThrow(/maxDelayMs must be a finite number in 0\.\.60000 ms/);
+  });
+
+  it("refuses an unbounded per-request timeout", () => {
+    expect(() =>
+      createLinearApiPort({ apiKey: DUMMY_API_KEY, teamId: TEAM_ID, requestTimeoutMs: 10 * 60_000 }),
+    ).toThrow(/requestTimeoutMs: must be a finite number in 1\.\.120000 ms/);
   });
 });
 
