@@ -151,11 +151,15 @@ export interface BlindQaDispatchResult {
 }
 
 /**
- * Dispatches one seat (builder/reviewer/security). The real adapter shells
- * out to the `claude` CLI; for this PR it is a thin stub clearly marked as
- * wired in a follow-up issue (matching this port's treatment in the spec) —
- * the runtime logic that calls it is complete and fully tested against
- * fakes.
+ * Dispatches one seat (builder/reviewer/security). The real adapter lives in
+ * `./agent.ts` (`createClaudeCliAgentPort`, ALI-161): it shells out to the
+ * `claude` CLI with an explicit per-seat `--model`, reads the seat's
+ * definition only from `DispatchContext.enginePath`, and bounds every
+ * dispatch with a wall-clock timeout — the last of which is what keeps a
+ * hung seat from holding a run past the hard backstop this file's
+ * `isBeyondHard()` checks. `dispatchBlindQa` stays a loud stub there until
+ * ALI-162 wires it. The port itself, and the run-loop logic that calls it,
+ * remain fully testable against fakes (see `__tests__/run.test.ts`).
  */
 export interface AgentPort {
   dispatch(seat: Seat, ctx: DispatchContext): Promise<AgentDispatchResult>;
@@ -176,25 +180,13 @@ export interface Clock {
   now(): number;
 }
 
-/** Real adapter — intentionally a stub. See `linear.ts`'s `createLinearApiPort` doc comment. */
-export function createClaudeCliAgentPort(): AgentPort {
-  return {
-    dispatch(): Promise<AgentDispatchResult> {
-      throw new Error(
-        "AgentPort real adapter not wired in this PR (shells out to the claude CLI) — " +
-          'see the ALI-103 PR\'s "Decisions the spec left open" section.',
-      );
-    },
-    dispatchBlindQa(): Promise<BlindQaDispatchResult> {
-      throw new Error(
-        "AgentPort real adapter not wired in this PR (dispatchBlindQa, shells out to the claude CLI) — " +
-          'see the ALI-103 PR\'s "Decisions the spec left open" section. ALI-105 wires the runtime dispatch ' +
-          "call itself (proven against fakes); the real claude-CLI adapter for it stays a stub, same as " +
-          "builder/reviewer/security.",
-      );
-    },
-  };
-}
+// The `AgentPort` real adapter used to live here as a throw-only stub. It now
+// lives in `./agent.ts` (ALI-161) — prompt assembly, subprocess management,
+// output parsing and the per-dispatch timeout are a separate concern from the
+// run loop, and keeping them here would put every future agent-adapter change
+// in the same clustering lane as every future run-loop change. The port types
+// (`Seat`, `DispatchContext`, `AgentDispatchResult`, `AgentPort`) stay here,
+// where their consumer is.
 
 export function createSystemClock(): Clock {
   return { now: () => Date.now() };
