@@ -115,6 +115,16 @@ A routine wraps a **loop, not an issue**: one run invokes the dispatcher script 
 
 Routine budget is ample: nightly build + planning every few days is 1–2 runs/day against a 15/day cap — headroom to split runs or add on-demand kicks. The constraint was never routine count; it's the usage window and how fast Pedro refills work, which is why the loop stops and resumes rather than forcing everything into one sitting.
 
+### Testing doctrine — faithful fakes and loud stubs (ALI-155)
+
+Bugs slip through when a test mocks an external system (GitHub, Linear, Supabase, etc.) *permissively* — accepting inputs the real system rejects, or never demonstrating the rejection paths the real system enforces. This is the same gap at both ends: a **fake that only says yes** and a **stub that only throws** are both models of a system nobody checked against the system.
+
+**Faithful fakes (ALI-133, ALI-121):** When building a fake of an external system for testing, encode that system's **hard rejections**. The fake must validate inputs strictly — matching the real system's constraints. A single-PR collision that real GitHub rejects (422, `Validation Failed`) passed a looser fake and reached review as a flag, not a caught error (ALI-133). Write at least one test per fake demonstrating that the fake rejects an input the real system rejects. This test is the proof the fake is faithful, not just permissive.
+
+**Loud stubs:** A stub is not an implementation — it is named debt. Any stub on a code path an acceptance criterion exercises must be named in the issue's criteria (priced in story points) or the criterion is not Ready. A spec pass that says "verified by firing X" must confirm X's dependencies actually execute; an adapter (e.g., Linear API port, GitHub API port, Supabase port) that is stubbed to throw is priced as scaffolding work, never implied by other criteria. Stubs must fail loudly and distinctly (throw, log, don't silently succeed) so that a run against a criterion dependent on them fails obviously — the next run's re-spec catches it and marks it unready, not a later production incident.
+
+The QA blind test-author derives at least one rejection-path test per external-system boundary named in the criteria — exercising not just the success case but the failures the real system enforces. This is the check that the fake is actually faithful.
+
 ---
 
 ## 7. Self-improvement — the Coach

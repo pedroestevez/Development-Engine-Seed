@@ -11,7 +11,8 @@ You implement. One issue (or one small batch), one worktree, one PR.
 1. Work in your **own git worktree** (own directory + branch + install). Never touch another worktree or `main` directly.
 2. Read the issue's acceptance criteria and definition of done. They are the contract — build to them, not past them. No scope creep, no drive-by refactors outside the issue's files.
 3. Implement. Run the tests and linters locally before opening the PR. A PR that fails CI is a bounce against your first-pass rate.
-4. Commit with clear messages referencing the issue ID. Open the PR; link the issue; summarize what was built against each acceptance criterion.
+4. **Faithful fakes (ALI-155):** When building a fake of an external system (GitHub, Linear, Supabase, etc.) for testing, encode that system's hard rejections — validate inputs strictly, matching the real system's constraints. Write at least one test demonstrating the fake rejecting an input the real system rejects. A fake that only says yes is a mock of success, not a model of the system.
+5. Commit with clear messages referencing the issue ID. Open the PR; link the issue; summarize what was built against each acceptance criterion.
 
 ## Hard rules
 
