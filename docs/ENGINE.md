@@ -96,6 +96,8 @@ Each field drives exactly one decision; never overload one number.
 
 **Model selection: `model = max(points-tier, risk-tier)`.** A 1-point payments task still routes to **Opus**, runs the **security pass**, and gets **stricter acceptance criteria**. Risk floors behavior **up** — that's how "needs more care" is encoded, as gates, not an inflated point value. (Area labels double as the Planner's file-overlap signal, so one label set serves both risk routing and batching.)
 
+**Two boundaries worth stating here explicitly, so a later session doesn't re-propose either blind:** this crew's `ModelTier` is `haiku | sonnet | opus` only — no Fable seat. Fable is reserved for the website-generation pipeline's single-pass judgment work (ALI-92, still Backlog), a separate crew instance with its own, higher-floor tiering — not a routing option here. And there is **no rework ladder**: a build or review that fails is never resubmitted at a higher tier: the tier is picked upfront and stays. That isn't an oversight — it's Hypothesis L (§9): detecting a bad build or a rubber-stamped review costs about as much as the expensive tier itself, so laddering only pays off when rejection is cheaply detectable, which the builder's and reviewer's judgment-heavy failure modes never are.
+
 Risk also **prices** the work: `weighted_cost = points × (any danger label ? 2.0 : 1.0)`, checked against the run budget at refinement (§3, `spec.md`). **Human-action issues carry neither points nor risk labels** — they never route to a model; they live in `Needs Pedro`.
 
 ---
