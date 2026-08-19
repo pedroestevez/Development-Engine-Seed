@@ -17,7 +17,7 @@ Two off-ramps, and the distinction matters: **Parked** = a backstop interrupted 
 
 ## Routing
 
-`model = max(points-tier, risk-tier)`. Points: 1 → Haiku, 2–3 → Sonnet, 5/architectural → Opus. Risk is binary, via labels: `payments`, `auth`, `data`, `rls`, `migration`, `external-api`, `critical`. Any risk label → Opus floor + security pass + stricter criteria. Priority = sequence only.
+`model = max(points-tier, risk-tier)`. Points: 1 → Haiku, 2–3 → Sonnet, 5/architectural → Opus. Risk is binary, via labels: `payments`, `auth`, `data`, `rls`, `migration`, `external-api`, `critical`. Any risk label → Opus floor + security pass + stricter criteria. Priority = sequence only. No Fable seat and no rework ladder in this crew — see `docs/ENGINE.md` §4/§9 before proposing either again.
 
 ## Concurrency
 
