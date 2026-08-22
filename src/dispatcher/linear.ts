@@ -9,9 +9,12 @@
  *
  * ALI-158 lands the REAL adapter's read half — `getWorkflowStatuses()`,
  * `getReadyIssuesInCycle()` and the issue→`LinearIssue` mapping — over Node
- * 22's built-in `fetch`, with no new npm dependency. The write half
- * (ALI-159) and the cycle-approval surface (ALI-163) remain unimplemented
- * and are loud stubs that name their owning issue.
+ * 22's built-in `fetch`, with no new npm dependency. ALI-159 lands the write
+ * half — `setIssueStatus()` and `addComment()` — over the same transport,
+ * reusing its retry/backoff helper and workflow-state name→id resolution.
+ * The cycle-approval surface (`getApprovedCycle`, `postCycleSummary`,
+ * ALI-163) remains unimplemented and stays a loud stub that names its
+ * owning issue.
  */
 
 import { scrubSecrets } from "./runlog.js";
@@ -144,6 +147,28 @@ export function statusDriftMessage(missing: readonly string[]): string {
 //           adapter that handled only one of them would spin or die on the
 //           other.
 //
+// Contract evidence, ALI-159 (write half), same source and same read date:
+//   LITERAL `Mutation.issueUpdate(id: String!, input: IssueUpdateInput!): IssuePayload!`
+//           — `id` doc: "The identifier of the issue to update", matching
+//           `CommentCreateInput.issueId`'s doc below: both accept a UUID OR
+//           the human-readable identifier (`ALI-159`), which is what
+//           `run.ts` passes as `issue.id`. `IssueUpdateInput.stateId: String`
+//           and `.cycleId: String` are BOTH nullable — `cycleId: null` is a
+//           legal write that clears the cycle (AC1's `null` case).
+//   LITERAL `Mutation.commentCreate(input: CommentCreateInput!): CommentPayload!`;
+//           `CommentCreateInput.issueId: String` doc: "Can be a UUID or issue
+//           identifier (e.g., 'LIN-123')." `CommentCreateInput` has NO
+//           `cycleId` field and no cycle-shaped parent at all — the schema
+//           evidence for `postCycleSummary` staying a stub (AC8).
+//   LITERAL `Query.issue(id: String!): Issue!` is NON-NULL, exactly like
+//           `Query.team`/`Query.cycle` above — an issue id Linear cannot
+//           resolve is a GraphQL error, not `null`, which is the hard
+//           rejection AC7 requires the fake to reproduce for `setIssueStatus`
+//           and `addComment` alike (both mutations' `id`/`issueId` args are
+//           resolved the same way `Query.issue`'s is).
+//   LITERAL `IssuePayload { issue: Issue, success: Boolean! }`,
+//           `CommentPayload { comment: Comment!, success: Boolean! }`.
+//
 // NOT PROVEN AGAINST THE REAL SYSTEM until AC9's live contract test has run
 // green once (needs ALI-157's credential). Everything below is proven against
 // a faithful fake, which is a different and weaker claim — see the PR body.
@@ -160,6 +185,16 @@ export const LINEAR_API_URL = "https://api.linear.app/graphql";
  */
 export const LINEAR_API_KEY_ENV = "LINEAR_API_KEY";
 export const LINEAR_TEAM_ID_ENV = "LINEAR_TEAM_ID";
+
+/**
+ * A throwaway Linear issue's identifier (e.g. `ALI-999`), for AC9's write-half
+ * live contract test to move between `Ready` and `Parked` and back. Not one
+ * of ALI-157's two named variables — this issue adds it, following the same
+ * naming discipline: named here so ALI-157 (or whoever provisions the live
+ * environment next) can grep for exactly this string, and so the loud skip
+ * can quote it. The designated issue must start the test in `Ready`.
+ */
+export const LINEAR_LIVE_TEST_ISSUE_ID_ENV = "LINEAR_LIVE_TEST_ISSUE_ID";
 
 /**
  * The one status the build loop fetches candidates from. A literal, matched
@@ -505,20 +540,49 @@ function backoffDelayMs(attempt: number, retryAfterHeader: string | null, policy
 }
 
 /**
+ * ALI-159 AC5 ("retries never double-write"): widens retry eligibility,
+ * beyond rate limiting, to HTTP 5xx responses AND a thrown transport
+ * exception (fetchImpl rejecting before any response is received) —
+ * scoped to the write path only, via the `retryServerErrors` option below.
+ *
+ * Why safe to retry there and NOT elsewhere: both conditions are ones "the
+ * adapter can show did not apply" (the issue's own words) — a 5xx is Linear
+ * telling us the request was not processed, and a transport exception means
+ * the request never completed a round trip at all. Resending in either case
+ * cannot turn one intended write into two *because* the first attempt never
+ * got as far as being applied. A 200 with a GraphQL error, or any other 4xx,
+ * is a different claim — Linear DID look at the request and rejected it —
+ * and those are never retried, exactly as before.
+ *
+ * Reads keep the narrower ALI-158 policy (`retryServerErrors` defaults to
+ * `false`): their retry behaviour, and the tests pinned to it (AC5's
+ * "does NOT retry a non-rate-limit failure"), are unchanged.
+ */
+interface ExecuteGraphQLOptions {
+  retryServerErrors?: boolean;
+}
+
+/**
  * The single HTTP path. Every exit is either parsed `data` or a
  * `LinearApiError` whose message has been through `scrubSecrets()` (AC6).
  *
- * Only rate limits are retried (AC5). A network failure, a timeout, a 5xx or
- * a GraphQL error fails immediately and loudly: this runs unattended behind
- * the Direction gate, where "stop and say why" beats "keep trying quietly".
+ * Only rate limits are retried by default (AC5, ALI-158). A network failure,
+ * a timeout, a 5xx or a GraphQL error fails immediately and loudly: this runs
+ * unattended behind the Direction gate, where "stop and say why" beats "keep
+ * trying quietly" — UNLESS the caller opts into `retryServerErrors` (AC5,
+ * ALI-159), which the write path does. A GraphQL error is never retried
+ * either way — no schema evidence puts a GraphQL-error class in the same
+ * "did not apply" bucket as a 5xx or a dropped connection.
  */
 async function executeGraphQL(
   runtime: AdapterRuntime,
   operationName: string,
   query: string,
   variables: Record<string, unknown>,
+  options: ExecuteGraphQLOptions = {},
 ): Promise<Record<string, unknown>> {
   const { retry } = runtime;
+  const retryServerErrors = options.retryServerErrors ?? false;
 
   for (let attempt = 1; attempt <= retry.maxAttempts; attempt++) {
     let response: HttpResponseLike;
@@ -535,6 +599,10 @@ async function executeGraphQL(
         signal: AbortSignal.timeout(runtime.requestTimeoutMs),
       });
     } catch (cause) {
+      if (retryServerErrors && attempt < retry.maxAttempts) {
+        await runtime.sleep(backoffDelayMs(attempt, null, retry));
+        continue;
+      }
       throw new LinearApiError(
         `Linear API request failed (${operationName}, attempt ${attempt}/${retry.maxAttempts}): ` +
           `${describeCause(cause)}`,
@@ -567,6 +635,19 @@ async function executeGraphQL(
           `Linear API rate limit not cleared: gave up on ${operationName} after ${retry.maxAttempts} ` +
             `attempt(s) (HTTP ${response.status}). Retries are bounded on purpose — an unattended run ` +
             `must never spin against a rate limit. Last response: ${snippet(bodyText)}`,
+        );
+      }
+      await runtime.sleep(backoffDelayMs(attempt, response.headers.get("retry-after"), retry));
+      continue;
+    }
+
+    const isRetryableServerError = retryServerErrors && response.status >= 500 && response.status <= 599;
+    if (isRetryableServerError) {
+      if (attempt >= retry.maxAttempts) {
+        throw new LinearApiError(
+          `Linear API server error not cleared: gave up on ${operationName} after ${retry.maxAttempts} ` +
+            `attempt(s) (HTTP ${response.status}). Retries are bounded on purpose — an unattended run must ` +
+            `never spin against a failing server. Last response: ${snippet(bodyText)}`,
         );
       }
       await runtime.sleep(backoffDelayMs(attempt, response.headers.get("retry-after"), retry));
@@ -911,11 +992,19 @@ export function mapIssueNode(rawNode: unknown): LinearIssue {
 // Queries
 // ---------------------------------------------------------------------------
 
+/**
+ * `id` is selected alongside `name` so ONE query serves both
+ * `getWorkflowStatuses()` (ALI-158, names only) and `resolveStateId()`
+ * (ALI-159, name→id for a write) — the "reuse the query" instruction in this
+ * issue's own text. Adding a field Linear already exposes on `WorkflowState`
+ * (it `implements Node`, so `id` is always there) costs nothing on the read
+ * side and avoids a second document walking the same pagination twice.
+ */
 const WORKFLOW_STATES_QUERY = `
   query DispatcherWorkflowStates($teamId: String!, $first: Int!, $after: String) {
     team(id: $teamId) {
       states(first: $first, after: $after) {
-        nodes { name }
+        nodes { id name }
         pageInfo { hasNextPage endCursor }
       }
     }
@@ -966,6 +1055,143 @@ function readPageInfo(connection: Record<string, unknown>): PageCursor {
 }
 
 // ---------------------------------------------------------------------------
+// Write-half queries (ALI-159)
+// ---------------------------------------------------------------------------
+
+/**
+ * ONE mutation document, used for BOTH the state-changing write and the
+ * cycle-only corrective re-save (AC1/AC2) — only the `input` variable
+ * differs (`{ stateId, cycleId }` vs `{ cycleId }` alone). This is what makes
+ * "the quirk fires on the state-changing write and not on a subsequent
+ * cycle-only update" a fact about the REQUEST SHAPE the adapter sends, not
+ * about which query text it used.
+ */
+const SET_ISSUE_FIELDS_MUTATION = `
+  mutation DispatcherSetIssueStatus($issueId: String!, $input: IssueUpdateInput!) {
+    issueUpdate(id: $issueId, input: $input) {
+      success
+    }
+  }
+`;
+
+/** The re-read half of verify-and-correct (AC1) — cycle only; nothing else about the issue is this method's business. */
+const ISSUE_CYCLE_QUERY = `
+  query DispatcherIssueCycle($issueId: String!) {
+    issue(id: $issueId) {
+      id
+      cycle { id }
+    }
+  }
+`;
+
+const ADD_COMMENT_MUTATION = `
+  mutation DispatcherAddComment($issueId: String!, $body: String!) {
+    commentCreate(input: { issueId: $issueId, body: $body }) {
+      success
+    }
+  }
+`;
+
+/**
+ * Walks `team.states` to completion, `{ id, name }` per state — the ONE
+ * paginator behind both `getWorkflowStatuses()` (maps to `name`) and
+ * `resolveStateId()` (looks up by `name`, returns `id`). Same cap, same
+ * "an unreadable workflow is never read as an empty one" doctrine as before;
+ * this is a refactor of ALI-158's loop, not new pagination logic.
+ */
+async function resolveWorkflowStates(runtime: AdapterRuntime): Promise<Array<{ id: string; name: string }>> {
+  const states: Array<{ id: string; name: string }> = [];
+  let after: string | null = null;
+
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const data = await executeGraphQL(runtime, "DispatcherWorkflowStates", WORKFLOW_STATES_QUERY, {
+      teamId: runtime.teamId,
+      first: PAGE_SIZE,
+      after,
+    });
+
+    const team = asRecord(data.team);
+    const statesConnection = asRecord(team?.states);
+    const nodes = statesConnection === null ? null : connectionNodes(statesConnection);
+    if (team === null || statesConnection === null || nodes === null) {
+      throw new LinearApiError(
+        `Linear returned no workflow states for team ${runtime.teamId}. The dispatcher matches on ` +
+          "literal status names (docs/ENGINE.md §3) — an unreadable workflow is never read as an " +
+          "empty one.",
+      );
+    }
+
+    for (const stateNode of nodes) {
+      const record = asRecord(stateNode);
+      const name = record?.name;
+      const id = record?.id;
+      if (typeof name !== "string" || typeof id !== "string" || id.trim() === "") {
+        throw new LinearApiError(`Linear returned a workflow state with no \`name\` for team ${runtime.teamId}.`);
+      }
+      states.push({ id, name });
+    }
+
+    const { hasNextPage, endCursor } = readPageInfo(statesConnection);
+    if (!hasNextPage || endCursor === null) return states;
+    after = endCursor;
+  }
+
+  throw new LinearApiError(
+    `Workflow-state pagination for team ${runtime.teamId} exceeded ${MAX_PAGES} pages — refusing to ` +
+      "keep paging. A truncated status list would silently change which statuses the drift check sees.",
+  );
+}
+
+/**
+ * AC4, the write-side hard error: an issue can only move to a status the
+ * team's workflow actually defines. Throws BEFORE any write is attempted —
+ * the caller of `resolveStateId` never reaches `issueUpdate` on failure, so
+ * an unresolvable name can never fall through to a no-op write. Same
+ * doctrine `statusDriftMessage()` states for reads ("a missing status is
+ * never the same thing as an empty cycle"), one layer over: here, a missing
+ * status is never the same thing as a successful move.
+ */
+async function resolveStateId(runtime: AdapterRuntime, status: IssueState): Promise<string> {
+  const states = await resolveWorkflowStates(runtime);
+  const match = states.find((state) => state.name === status);
+  if (match === undefined) {
+    throw new LinearApiError(
+      `Cannot move an issue to status "${status}": it is not a workflow state on team ${runtime.teamId} ` +
+        `(states: ${states.map((state) => state.name).join(", ")}). The dispatcher matches on literal ` +
+        "status names (docs/ENGINE.md §3) — an unresolvable status is never treated as a no-op write, " +
+        "the same doctrine statusDriftMessage() sets for reads.",
+    );
+  }
+  return match.id;
+}
+
+/**
+ * The observed half of verify-and-correct (AC1): reads back exactly the
+ * field the invariant is about. A `cycle` field that is present but
+ * malformed (no usable `id`) is NOT the same as "no cycle" — that would let
+ * a broken response masquerade as a successful clear, so it throws instead
+ * of silently returning `null`.
+ */
+function readObservedCycleId(data: Record<string, unknown>, issueId: string): string | null {
+  const issue = asRecord(data.issue);
+  if (issue === null) {
+    throw new LinearApiError(`${issueId}: Linear returned no issue when re-reading its cycle after a status move.`);
+  }
+  if (issue.cycle === null || issue.cycle === undefined) return null;
+  const cycle = asRecord(issue.cycle);
+  const cycleId = cycle?.id;
+  if (typeof cycleId !== "string" || cycleId.trim() === "") {
+    throw new LinearApiError(`${issueId}: Linear returned a \`cycle\` with no usable id when re-reading it.`);
+  }
+  return cycleId;
+}
+
+/** Renders `null` readably inside an error message — `"null"` vs a UUID, never ambiguous with an empty string. */
+function describeCycleId(cycleId: string | null): string {
+  return cycleId === null ? "null" : cycleId;
+}
+
+// ---------------------------------------------------------------------------
 // Loud stubs (AC8) — the four methods this issue does NOT wire
 // ---------------------------------------------------------------------------
 
@@ -979,9 +1205,9 @@ function readPageInfo(connection: Record<string, unknown>): PageCursor {
 function loudStub(method: string, owningIssue: string, consequence: string): () => never {
   return (): never => {
     throw new LinearApiError(
-      `LinearPort.${method}() is a STUB — not implemented by the read-half adapter (ALI-158). ` +
-        `It is wired by ${owningIssue}. ${consequence} Until ${owningIssue} lands this method fails ` +
-        "loudly by design (docs/ENGINE.md §6, loud stubs).",
+      `LinearPort.${method}() is a STUB — not implemented by this adapter (ALI-158/ALI-159's read and ` +
+        `write halves). It is wired by ${owningIssue}. ${consequence} Until ${owningIssue} lands this ` +
+        "method fails loudly by design (docs/ENGINE.md §6, loud stubs).",
     );
   };
 }
@@ -991,57 +1217,21 @@ function loudStub(method: string, owningIssue: string, consequence: string): () 
 // ---------------------------------------------------------------------------
 
 /**
- * Real `LinearPort` adapter — READ half (ALI-158).
+ * Real `LinearPort` adapter — READ half (ALI-158) and WRITE half (ALI-159).
  *
- * Implemented here: `getWorkflowStatuses`, `getReadyIssuesInCycle`, and the
- * issue→`LinearIssue` mapping. The write half (`setIssueStatus`,
- * `addComment`) is ALI-159; the cycle-approval surface (`getApprovedCycle`,
- * `postCycleSummary`) is ALI-163, itself blocked on ALI-156 naming the
- * approval token. Those four are loud stubs, by name (AC8).
+ * Implemented here: `getWorkflowStatuses`, `getReadyIssuesInCycle`, the
+ * issue→`LinearIssue` mapping, `setIssueStatus`, and `addComment`. The
+ * cycle-approval surface (`getApprovedCycle`, `postCycleSummary`) is
+ * ALI-163, blocked on ALI-156 naming the approval token — those two stay
+ * loud stubs, by name (AC8).
  */
 export function createLinearApiPort(config: LinearApiConfig): LinearPort {
   const runtime = validateConfig(config);
 
   return {
     async getWorkflowStatuses(): Promise<string[]> {
-      const names: string[] = [];
-      let after: string | null = null;
-
-      for (let page = 1; page <= MAX_PAGES; page++) {
-        const data = await executeGraphQL(runtime, "DispatcherWorkflowStates", WORKFLOW_STATES_QUERY, {
-          teamId: runtime.teamId,
-          first: PAGE_SIZE,
-          after,
-        });
-
-        const team = asRecord(data.team);
-        const states = asRecord(team?.states);
-        const nodes = states === null ? null : connectionNodes(states);
-        if (team === null || states === null || nodes === null) {
-          throw new LinearApiError(
-            `Linear returned no workflow states for team ${runtime.teamId}. The dispatcher matches on ` +
-              "literal status names (docs/ENGINE.md §3) — an unreadable workflow is never read as an " +
-              "empty one.",
-          );
-        }
-
-        for (const stateNode of nodes) {
-          const name = asRecord(stateNode)?.name;
-          if (typeof name !== "string") {
-            throw new LinearApiError(`Linear returned a workflow state with no \`name\` for team ${runtime.teamId}.`);
-          }
-          names.push(name);
-        }
-
-        const { hasNextPage, endCursor } = readPageInfo(states);
-        if (!hasNextPage || endCursor === null) return names;
-        after = endCursor;
-      }
-
-      throw new LinearApiError(
-        `Workflow-state pagination for team ${runtime.teamId} exceeded ${MAX_PAGES} pages — refusing to ` +
-          "keep paging. A truncated status list would silently change which statuses the drift check sees.",
-      );
+      const states = await resolveWorkflowStates(runtime);
+      return states.map((state) => state.name);
     },
 
     async getReadyIssuesInCycle(cycleId: string): Promise<LinearIssue[]> {
@@ -1129,18 +1319,109 @@ export function createLinearApiPort(config: LinearApiConfig): LinearPort {
       "Returning a cycle from a stub would forge the Direction gate's admission ticket — the one thing " +
         "that must never be synthesised (ALI-156 names the approval token first).",
     ),
-    setIssueStatus: loudStub(
-      "setIssueStatus",
-      "ALI-159",
-      "Silently succeeding would leave Linear's board disagreeing with what actually ran, which is the " +
-        "state the verify-and-correct half exists to prevent.",
-    ),
-    addComment: loudStub(
-      "addComment",
-      "ALI-159",
-      "Escalations and blind-QA skip notices are posted through it; a silent no-op would drop the " +
-        "escalation path (docs/ENGINE.md §12).",
-    ),
+    /**
+     * AC1/AC2 — the write, then verify-and-correct, bounded at ONE re-save
+     * plus one re-read (never an unbounded loop; see the module doc's
+     * "Correction is bounded" note and the observed evidence in the issue
+     * body: the quirk fires on the state-changing write below and did NOT
+     * fire on the corrective, cycle-only re-save that follows it, so this
+     * sequence terminates by construction, not by luck).
+     */
+    async setIssueStatus(issueId: string, status: IssueState, cycleId: string | null): Promise<void> {
+      if (typeof issueId !== "string" || issueId.trim() === "") {
+        throw new LinearApiError(
+          "setIssueStatus() was called with an empty issue id. Every terminal-state transition the run " +
+            "loop produces goes through this method (docs/ENGINE.md §3) — an empty id is never a no-op.",
+        );
+      }
+
+      // AC4: resolved BEFORE any write. A name absent from the team's
+      // workflow throws here and `issueUpdate` below is never reached.
+      const stateId = await resolveStateId(runtime, status);
+
+      async function applyIssueUpdate(input: Record<string, unknown>): Promise<void> {
+        await executeGraphQL(
+          runtime,
+          "DispatcherSetIssueStatus",
+          SET_ISSUE_FIELDS_MUTATION,
+          { issueId, input },
+          // AC5: a write that never got a response, or that Linear explicitly
+          // says it did not process (429/5xx), is safe to resend — see
+          // ExecuteGraphQLOptions's doc comment for why this cannot double-write.
+          { retryServerErrors: true },
+        );
+      }
+
+      async function readObservedCycle(): Promise<string | null> {
+        const data = await executeGraphQL(
+          runtime,
+          "DispatcherIssueCycle",
+          ISSUE_CYCLE_QUERY,
+          { issueId },
+          { retryServerErrors: true },
+        );
+        return readObservedCycleId(data, issueId);
+      }
+
+      // The state-changing write. `cycleId` is sent explicitly here too —
+      // never omitted to "let Linear keep whatever it has" — but the quirk
+      // means Linear may still attach a DIFFERENT cycle regardless of what
+      // was sent, which is exactly what the re-read below checks for.
+      await applyIssueUpdate({ stateId, cycleId });
+
+      let observedCycleId = await readObservedCycle();
+      if (observedCycleId === cycleId) return;
+
+      // AC2, both directions: whether `cycleId` was `null` (caller wants no
+      // cycle) or a specific id (caller wants a DIFFERENT cycle than the one
+      // Linear auto-attached), the fix is the same cycle-only update — never
+      // re-sending `stateId`, which is what would re-arm the quirk.
+      await applyIssueUpdate({ cycleId });
+      observedCycleId = await readObservedCycle();
+      if (observedCycleId === cycleId) return;
+
+      throw new LinearApiError(
+        `${issueId}: cycle verify-and-correct failed after the one correction this adapter allows — ` +
+          `intended cycle ${describeCycleId(cycleId)}, observed ${describeCycleId(observedCycleId)}. ` +
+          "This is the invariant this method exists to hold (an issue's cycle is exactly what the caller " +
+          "requested, never a value Linear chose) — treat this issue as NOT successfully moved.",
+      );
+    },
+
+    /**
+     * AC3: never swallows a failure that follows a successful status move —
+     * `run.ts` always calls `setIssueStatus` before `addComment` for the same
+     * terminal transition, so a caller reading this error already knows a
+     * status move just landed; this names the issue and echoes back what it
+     * tried to post (safe — a comment body carries no credential) so the run
+     * log's record of "what actually happened" does not go silent on the
+     * comment alone while the status change stands.
+     */
+    async addComment(issueId: string, body: string): Promise<void> {
+      if (typeof issueId !== "string" || issueId.trim() === "") {
+        throw new LinearApiError(
+          "addComment() was called with an empty issue id. Escalations and skip notices are posted " +
+            "through this method (docs/ENGINE.md §12) — an empty id is never a silent no-op.",
+        );
+      }
+      try {
+        await executeGraphQL(
+          runtime,
+          "DispatcherAddComment",
+          ADD_COMMENT_MUTATION,
+          { issueId, body },
+          // AC5, same reasoning as setIssueStatus above.
+          { retryServerErrors: true },
+        );
+      } catch (cause) {
+        throw new LinearApiError(
+          `${issueId}: addComment failed (${describeCause(cause)}). A status move that already succeeded ` +
+            "earlier in this same operation is NOT undone by this failure — Linear's board and the run " +
+            `log can now disagree, so this is never swallowed. Comment attempted: ${snippet(body)}`,
+          { cause },
+        );
+      }
+    },
     postCycleSummary: loudStub(
       "postCycleSummary",
       "ALI-163",

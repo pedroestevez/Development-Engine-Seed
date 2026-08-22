@@ -29,6 +29,7 @@ import {
   LinearApiError,
   LINEAR_API_KEY_ENV,
   LINEAR_API_URL,
+  LINEAR_LIVE_TEST_ISSUE_ID_ENV,
   LINEAR_TEAM_ID_ENV,
   mapIssueNode,
   parsePredictedFiles,
@@ -40,6 +41,7 @@ import {
   type LinearApiConfig,
 } from "../linear.js";
 import { containsSecretLike } from "../runlog.js";
+import type { IssueState } from "../types.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -132,6 +134,26 @@ interface FakeWorld {
   states: string[];
   cycleIds: string[];
   issues: FakeIssue[];
+  /**
+   * The cycle a state-changing write auto-attaches, modelling the quirk this
+   * whole issue exists for (AC2). Defaults to `CYCLE_ID` — most read-path
+   * tests never touch it — but write tests set it independently of whatever
+   * cycle the caller intends, so both directions of the quirk are reachable:
+   * intended `null` vs current non-null, and intended X vs current Y ≠ X.
+   */
+  currentCycleId: string | null;
+  /** `issueId -> comment bodies`, in post order. What AC5's "not two" checks against. */
+  comments: Map<string, string[]>;
+}
+
+/** Deterministic, fixture-only workflow-state id — real Linear's are UUIDs, this only needs to be stable per name. */
+function stateIdFor(name: string): string {
+  return `state:${name}`;
+}
+
+/** Local copy of the adapter's own `asRecord` — the fake models Linear's wire format, it does not import the adapter's internals. */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 }
 
 function fakeIssue(overrides: Partial<FakeIssue> & { identifier: string }): FakeIssue {
@@ -157,6 +179,8 @@ function defineFakeWorld(world: Partial<FakeWorld> = {}): FakeWorld {
     states: BOARD_STATES,
     cycleIds: [CYCLE_ID, OTHER_CYCLE_ID],
     issues: [],
+    currentCycleId: CYCLE_ID,
+    comments: new Map(),
     ...world,
   };
 
@@ -271,7 +295,7 @@ function createFakeLinear(world: FakeWorld): { fetchImpl: FetchLike; calls: Reco
         data: {
           team: {
             states: {
-              nodes: page.map((name) => ({ name })),
+              nodes: page.map((name) => ({ id: stateIdFor(name), name })),
               pageInfo: {
                 hasNextPage: nextIndex < world.states.length,
                 endCursor: nextIndex < world.states.length ? String(nextIndex) : null,
@@ -280,6 +304,75 @@ function createFakeLinear(world: FakeWorld): { fetchImpl: FetchLike; calls: Reco
           },
         },
       });
+    }
+
+    if (query.includes("DispatcherSetIssueStatus")) {
+      const issueId = variables.issueId;
+      const input = asRecord(variables.input) ?? {};
+      const issue = typeof issueId === "string" ? world.issues.find((candidate) => candidate.identifier === issueId) : undefined;
+      if (issue === undefined) {
+        // Hard rejection (AC7): `issueUpdate`'s `id` is resolved the same way
+        // `Query.issue`'s is — an id Linear cannot resolve is a GraphQL error.
+        return graphqlErrors([`Entity not found: Issue - could not find referenced Issue.`]);
+      }
+      const unknownKeys = Object.keys(input).filter((key) => !["stateId", "cycleId"].includes(key));
+      if (unknownKeys.length > 0) {
+        return graphqlErrors([`Field '${unknownKeys[0]}' is not defined by type 'IssueUpdateInput'.`]);
+      }
+      const isStateChanging = Object.prototype.hasOwnProperty.call(input, "stateId");
+      if (isStateChanging) {
+        const stateId = input.stateId;
+        const matchedState = world.states.find((name) => stateIdFor(name) === stateId);
+        if (typeof stateId !== "string" || matchedState === undefined) {
+          // Hard rejection (AC7): a state id the team's workflow does not define.
+          return graphqlErrors([`Cycle - could not find referenced WorkflowState.`]);
+        }
+        issue.stateName = matchedState;
+        // THE QUIRK (AC2): a state-changing write ignores the caller's
+        // requested cycle and attaches the fake's own "current cycle" —
+        // reproducing both directions the real system exhibited: a
+        // null-intended write comes back cycled, and an X-intended write
+        // comes back cycled to the DIFFERENT, already-current cycle Y.
+        issue.cycleId = world.currentCycleId;
+      } else if (Object.prototype.hasOwnProperty.call(input, "cycleId")) {
+        // The corrective, cycle-only update — the quirk does NOT fire here
+        // (the issue's own newly-observed, load-bearing fact): the requested
+        // value is honoured exactly.
+        const requestedCycleId = input.cycleId;
+        if (requestedCycleId !== null && (typeof requestedCycleId !== "string" || !world.cycleIds.includes(requestedCycleId))) {
+          return graphqlErrors([`Entity not found: Cycle - could not find referenced Cycle.`]);
+        }
+        issue.cycleId = requestedCycleId === null ? null : requestedCycleId;
+      }
+      return jsonResponse(200, { data: { issueUpdate: { success: true } } });
+    }
+
+    if (query.includes("DispatcherIssueCycle")) {
+      const issueId = variables.issueId;
+      const issue = typeof issueId === "string" ? world.issues.find((candidate) => candidate.identifier === issueId) : undefined;
+      if (issue === undefined) {
+        // Hard rejection (AC7): non-null `Query.issue` ⇒ error, not null.
+        return graphqlErrors([`Entity not found: Issue - could not find referenced Issue.`]);
+      }
+      return jsonResponse(200, {
+        data: { issue: { id: issue.identifier, cycle: issue.cycleId === null ? null : { id: issue.cycleId } } },
+      });
+    }
+
+    if (query.includes("DispatcherAddComment")) {
+      const issueId = variables.issueId;
+      const body = variables.body;
+      const issue = typeof issueId === "string" ? world.issues.find((candidate) => candidate.identifier === issueId) : undefined;
+      if (issue === undefined) {
+        return graphqlErrors([`Entity not found: Issue - could not find referenced Issue.`]);
+      }
+      if (typeof body !== "string") {
+        return graphqlErrors([`Field 'body' of required type 'String!' was not provided.`]);
+      }
+      const existing = world.comments.get(issueId as string) ?? [];
+      existing.push(body);
+      world.comments.set(issueId as string, existing);
+      return jsonResponse(200, { data: { commentCreate: { success: true } } });
     }
 
     if (query.includes("DispatcherReadyIssues")) {
@@ -1050,17 +1143,451 @@ describe("AC7: the fake Linear encodes Linear's hard rejections", () => {
 });
 
 // ---------------------------------------------------------------------------
-// AC8 — the four unwired methods are loud stubs that name their owner
+// ALI-159, write half — AC1: setIssueStatus() writes, then verify-and-correct
 // ---------------------------------------------------------------------------
 
-describe("AC8: getApprovedCycle, setIssueStatus, addComment and postCycleSummary are loud stubs", () => {
+/** Reads an issue straight out of the mutable fake world — the ground truth `setIssueStatus()`'s return type (`void`) cannot expose. */
+function worldCycleOf(world: FakeWorld, identifier: string): string | null {
+  const issue = world.issues.find((candidate) => candidate.identifier === identifier);
+  if (issue === undefined) throw new Error(`fixture bug: ${identifier} not in world`);
+  return issue.cycleId;
+}
+
+describe("ALI-159 AC1: setIssueStatus() applies the move, then re-reads and asserts the cycle", () => {
+  it("no correction needed: the write already lands the intended cycle — exactly one write, one re-read", async () => {
+    const world = defineFakeWorld({
+      issues: [fakeIssue({ identifier: "ALI-1001", stateName: "Ready", cycleId: CYCLE_ID })],
+      currentCycleId: CYCLE_ID, // matches what's about to be requested — no quirk mismatch to correct
+    });
+    const { port, calls } = portFor(world);
+
+    await port.setIssueStatus("ALI-1001", "Parked", CYCLE_ID);
+
+    expect(worldCycleOf(world, "ALI-1001")).toBe(CYCLE_ID);
+    const opNames = calls.map((call) => call.query);
+    expect(opNames.filter((q) => q.includes("DispatcherSetIssueStatus"))).toHaveLength(1);
+    expect(opNames.filter((q) => q.includes("DispatcherIssueCycle"))).toHaveLength(1);
+  });
+
+  it("sends the resolved stateId, not the status NAME, on the wire", async () => {
+    const world = defineFakeWorld({
+      issues: [fakeIssue({ identifier: "ALI-1002", stateName: "Ready", cycleId: CYCLE_ID })],
+      currentCycleId: CYCLE_ID,
+    });
+    const { port, calls } = portFor(world);
+
+    await port.setIssueStatus("ALI-1002", "Parked", CYCLE_ID);
+
+    const writeCall = calls.find((call) => call.query.includes("DispatcherSetIssueStatus"));
+    const input = writeCall?.variables.input as Record<string, unknown>;
+    expect(input.stateId).toBe(stateIdFor("Parked"));
+    expect(input.stateId).not.toBe("Parked");
+  });
+
+  it("bounded: after the one correction attempt still disagrees, throws naming the issue, intended and observed cycle — never a third round trip", async () => {
+    // A hostile transport that never lets the corrective write take: every
+    // re-read comes back with STUCK_CYCLE regardless of what was requested.
+    const STUCK_CYCLE = "11111111-1111-4111-8111-111111111111";
+    let writeCalls = 0;
+    let readCalls = 0;
+    const port = portWithTransport(async (_url, init) => {
+      const body = JSON.parse(init.body) as { query: string };
+      if (body.query.includes("DispatcherSetIssueStatus")) {
+        writeCalls++;
+        return jsonResponse(200, { data: { issueUpdate: { success: true } } });
+      }
+      if (body.query.includes("DispatcherIssueCycle")) {
+        readCalls++;
+        return jsonResponse(200, { data: { issue: { id: "ALI-1003", cycle: { id: STUCK_CYCLE } } } });
+      }
+      if (body.query.includes("DispatcherWorkflowStates")) {
+        return jsonResponse(200, {
+          data: { team: { states: { nodes: [{ id: stateIdFor("Parked"), name: "Parked" }], pageInfo: { hasNextPage: false, endCursor: null } } } },
+        });
+      }
+      throw new Error(`unexpected operation: ${body.query}`);
+    });
+
+    await expect(port.setIssueStatus("ALI-1003", "Parked", CYCLE_ID)).rejects.toThrow(
+      /ALI-1003: cycle verify-and-correct failed after the one correction/,
+    );
+    await expect(port.setIssueStatus("ALI-1003", "Parked", CYCLE_ID)).rejects.toThrow(
+      new RegExp(`intended cycle ${CYCLE_ID}, observed ${STUCK_CYCLE}`),
+    );
+    // Two independent calls above: each is bounded at exactly 2 writes (initial
+    // + one correction) and 2 re-reads — never a third of either.
+    expect(writeCalls).toBe(4);
+    expect(readCalls).toBe(4);
+  });
+
+  it("refuses an empty issue id rather than treating it as a no-op", async () => {
+    const { port } = portFor(defineFakeWorld());
+    await expect(port.setIssueStatus("  ", "Parked", CYCLE_ID)).rejects.toThrow(/empty issue id/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ALI-159 AC2 — THE TEETH: the quirk, both directions, via the faithful fake
+// ---------------------------------------------------------------------------
+
+describe("ALI-159 AC2: cycle verify-and-correct fires in BOTH directions", () => {
+  it("(a) intended null, fake attaches its current cycle, corrected back to null", async () => {
+    const world = defineFakeWorld({
+      issues: [fakeIssue({ identifier: "ALI-1101", stateName: "Ready", cycleId: CYCLE_ID })],
+      currentCycleId: CYCLE_ID, // the fake's "current cycle" the quirk auto-attaches
+    });
+    const { port } = portFor(world);
+
+    await port.setIssueStatus("ALI-1101", "Needs Pedro", null);
+
+    expect(worldCycleOf(world, "ALI-1101")).toBeNull();
+  });
+
+  it("(b) intended cycle X, fake's current cycle is a DIFFERENT Y, corrected to X", async () => {
+    const world = defineFakeWorld({
+      issues: [fakeIssue({ identifier: "ALI-1102", stateName: "Ready", cycleId: OTHER_CYCLE_ID })],
+      currentCycleId: OTHER_CYCLE_ID, // Y — deliberately NOT the CYCLE_ID about to be requested (X)
+    });
+    const { port } = portFor(world);
+
+    await port.setIssueStatus("ALI-1102", "Parked", CYCLE_ID);
+
+    expect(worldCycleOf(world, "ALI-1102")).toBe(CYCLE_ID);
+  });
+
+  it("the fake actually reproduces the quirk on the raw write (proving the test isn't vacuous)", async () => {
+    // Without the adapter's correction, a single write leaves the WRONG
+    // cycle — this is what makes (a) and (b) above meaningful assertions
+    // about the adapter's behaviour, not the fake's.
+    const world = defineFakeWorld({
+      issues: [fakeIssue({ identifier: "ALI-1103", stateName: "Ready", cycleId: OTHER_CYCLE_ID })],
+      currentCycleId: OTHER_CYCLE_ID,
+    });
+    const { fetchImpl } = createFakeLinear(world);
+    await fetchImpl(FAKE_ENDPOINT, {
+      method: "POST",
+      headers: { Authorization: DUMMY_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query: "mutation DispatcherSetIssueStatus { issueUpdate }",
+        variables: { issueId: "ALI-1103", input: { stateId: stateIdFor("Parked"), cycleId: CYCLE_ID } },
+      }),
+    });
+    expect(worldCycleOf(world, "ALI-1103")).toBe(OTHER_CYCLE_ID); // NOT CYCLE_ID — the quirk, unmasked
+  });
+
+  it("the corrective, cycle-only update is NOT subject to the quirk — it lands exactly what was sent", async () => {
+    const world = defineFakeWorld({
+      issues: [fakeIssue({ identifier: "ALI-1104", stateName: "Ready", cycleId: OTHER_CYCLE_ID })],
+      currentCycleId: OTHER_CYCLE_ID,
+    });
+    const { fetchImpl } = createFakeLinear(world);
+    await fetchImpl(FAKE_ENDPOINT, {
+      method: "POST",
+      headers: { Authorization: DUMMY_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query: "mutation DispatcherSetIssueStatus { issueUpdate }",
+        variables: { issueId: "ALI-1104", input: { cycleId: CYCLE_ID } }, // no stateId: cycle-only
+      }),
+    });
+    expect(worldCycleOf(world, "ALI-1104")).toBe(CYCLE_ID); // honoured, unlike the state-changing write above
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ALI-159 AC3 — partial write is never silent
+// ---------------------------------------------------------------------------
+
+describe("ALI-159 AC3: a status move that succeeds, followed by a failing comment, is never silent", () => {
+  it("names the issue AND the status that was already applied when addComment fails after setIssueStatus succeeds", async () => {
+    const ISSUE_ID = "ALI-1201";
+    const world = defineFakeWorld({
+      issues: [fakeIssue({ identifier: ISSUE_ID, stateName: "Ready", cycleId: CYCLE_ID })],
+      currentCycleId: CYCLE_ID,
+    });
+    const { fetchImpl } = createFakeLinear(world);
+    const port = createLinearApiPort({
+      apiKey: DUMMY_API_KEY,
+      teamId: TEAM_ID,
+      endpoint: FAKE_ENDPOINT,
+      sleep: async () => {},
+      retry: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 },
+      fetchImpl: async (url, init) => {
+        const body = JSON.parse(init.body) as { query: string };
+        if (body.query.includes("DispatcherAddComment")) {
+          return jsonResponse(403, { message: "comment rejected" });
+        }
+        return fetchImpl(url, init);
+      },
+    });
+
+    // The status move succeeds — this is the "already applied" state the
+    // comment failure below must not be allowed to hide.
+    await port.setIssueStatus(ISSUE_ID, "Parked", CYCLE_ID);
+    expect(worldCycleOf(world, ISSUE_ID)).toBe(CYCLE_ID);
+
+    // The comment body itself is what the caller (run.ts) uses to record
+    // status context; addComment echoes back what it attempted to post so a
+    // failure here still names the status alongside the issue.
+    await expect(port.addComment(ISSUE_ID, "Status: Parked — interrupted by the run backstop.")).rejects.toThrow(
+      new RegExp(`${ISSUE_ID}.*Parked`, "s"),
+    );
+  });
+
+  it("does not swallow the failure — the caller sees a rejected promise, not a silent success", async () => {
+    const port = portWithTransport(respondWith(jsonResponse(403, { message: "nope" })).fetchImpl, {
+      retry: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 },
+    });
+    await expect(port.addComment("ALI-1202", "body")).rejects.toThrow(LinearApiError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ALI-159 AC4 — an unknown status name is a hard error, and performs NO write
+// ---------------------------------------------------------------------------
+
+describe("ALI-159 AC4: setIssueStatus() with an unresolvable status name throws and writes nothing", () => {
+  it("throws naming the offending status, before ever attempting a write", async () => {
+    const world = defineFakeWorld({ issues: [fakeIssue({ identifier: "ALI-1301", stateName: "Ready" })] });
+    const { port, calls } = portFor(world);
+
+    await expect(port.setIssueStatus("ALI-1301", "Bogus Status" as unknown as IssueState, CYCLE_ID)).rejects.toThrow(
+      /Cannot move an issue to status "Bogus Status"/,
+    );
+
+    // Only the workflow-states READ happened — no issueUpdate was ever sent.
+    expect(calls.some((call) => call.query.includes("DispatcherSetIssueStatus"))).toBe(false);
+    expect(worldCycleOf(world, "ALI-1301")).toBe(CYCLE_ID); // untouched
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ALI-159 AC5 — retries never double-write
+// ---------------------------------------------------------------------------
+
+/** Fails the Nth+ matching operation this many times (network throw), then delegates to `inner`. */
+function failTransportThenDelegate(operationSubstring: string, failures: number, inner: FetchLike): FetchLike {
+  let seen = 0;
+  return async (url, init) => {
+    const body = JSON.parse(init.body) as { query: string };
+    if (body.query.includes(operationSubstring) && seen < failures) {
+      seen++;
+      throw new Error("ECONNRESET (fixture): connection dropped before any response");
+    }
+    return inner(url, init);
+  };
+}
+
+/** Answers the Nth+ matching operation with `response`, then delegates to `inner`. */
+function failHttpThenDelegate(
+  operationSubstring: string,
+  failures: number,
+  response: HttpResponseLike,
+  inner: FetchLike,
+): FetchLike {
+  let seen = 0;
+  return async (url, init) => {
+    const body = JSON.parse(init.body) as { query: string };
+    if (body.query.includes(operationSubstring) && seen < failures) {
+      seen++;
+      return response;
+    }
+    return inner(url, init);
+  };
+}
+
+describe("ALI-159 AC5: retries never double-write", () => {
+  it("addComment: fails transport once, succeeds on retry — exactly ONE comment, not two", async () => {
+    const world = defineFakeWorld({ issues: [fakeIssue({ identifier: "ALI-1401" })] });
+    const { fetchImpl } = createFakeLinear(world);
+    const port = createLinearApiPort({
+      apiKey: DUMMY_API_KEY,
+      teamId: TEAM_ID,
+      endpoint: FAKE_ENDPOINT,
+      sleep: async () => {},
+      fetchImpl: failTransportThenDelegate("DispatcherAddComment", 1, fetchImpl),
+    });
+
+    await port.addComment("ALI-1401", "hello");
+
+    expect(world.comments.get("ALI-1401")).toEqual(["hello"]);
+  });
+
+  it("addComment: a 503 (5xx) is retried too, per AC5's own words — exactly ONE comment", async () => {
+    const world = defineFakeWorld({ issues: [fakeIssue({ identifier: "ALI-1402" })] });
+    const { fetchImpl } = createFakeLinear(world);
+    const port = createLinearApiPort({
+      apiKey: DUMMY_API_KEY,
+      teamId: TEAM_ID,
+      endpoint: FAKE_ENDPOINT,
+      sleep: async () => {},
+      fetchImpl: failHttpThenDelegate("DispatcherAddComment", 1, jsonResponse(503, { message: "overloaded" }), fetchImpl),
+    });
+
+    await port.addComment("ALI-1402", "hello again");
+
+    expect(world.comments.get("ALI-1402")).toEqual(["hello again"]);
+  });
+
+  it("addComment: a 403 (4xx, not 429) is NEVER retried — exactly ONE attempt, no sleep, zero comments", async () => {
+    // Counts every attempt directly (never delegating to the fake), so this
+    // catches a retry regardless of whether the fake ever sees it — the
+    // point being tested is call COUNT, which "the fake never got a second
+    // request" cannot distinguish from "the wrapper never got a second call".
+    const guard = guardedSleep();
+    let attempts = 0;
+    const port = createLinearApiPort({
+      apiKey: DUMMY_API_KEY,
+      teamId: TEAM_ID,
+      endpoint: FAKE_ENDPOINT,
+      sleep: guard.sleep,
+      retry: { maxAttempts: 3, baseDelayMs: 10, maxDelayMs: 40 },
+      fetchImpl: async () => {
+        attempts++;
+        return jsonResponse(403, { message: "forbidden" });
+      },
+    });
+
+    await expect(port.addComment("ALI-1403", "hello")).rejects.toThrow(/HTTP 403/);
+    expect(attempts).toBe(1);
+    expect(guard.delays).toEqual([]);
+  });
+
+  it("addComment: bounded — persistent failure gives up rather than spinning, and still writes nothing", async () => {
+    const guard = guardedSleep();
+    const port = createLinearApiPort({
+      apiKey: DUMMY_API_KEY,
+      teamId: TEAM_ID,
+      endpoint: FAKE_ENDPOINT,
+      sleep: guard.sleep,
+      retry: { maxAttempts: 3, baseDelayMs: 10, maxDelayMs: 40 },
+      fetchImpl: async () => jsonResponse(503, { message: "still overloaded" }),
+    });
+
+    await expect(port.addComment("ALI-1404", "hello")).rejects.toThrow(/gave up on DispatcherAddComment after 3/);
+    expect(guard.delays).toEqual([10, 20]);
+  });
+
+  it("setIssueStatus: the state-changing write itself is retried on a transport failure, and applies exactly once", async () => {
+    const world = defineFakeWorld({
+      issues: [fakeIssue({ identifier: "ALI-1405", stateName: "Ready", cycleId: CYCLE_ID })],
+      currentCycleId: CYCLE_ID,
+    });
+    const { fetchImpl } = createFakeLinear(world);
+    const port = createLinearApiPort({
+      apiKey: DUMMY_API_KEY,
+      teamId: TEAM_ID,
+      endpoint: FAKE_ENDPOINT,
+      sleep: async () => {},
+      fetchImpl: failTransportThenDelegate("DispatcherSetIssueStatus", 1, fetchImpl),
+    });
+
+    await port.setIssueStatus("ALI-1405", "Parked", CYCLE_ID);
+    expect(worldCycleOf(world, "ALI-1405")).toBe(CYCLE_ID);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ALI-159 AC6 — the write path never leaks a credential through an error
+// ---------------------------------------------------------------------------
+
+describe("ALI-159 AC6: no write-path error message can carry a credential", () => {
+  const LEAKED = "lin_api_WRITEPATHLEAK";
+
+  it("setIssueStatus: a leaked-looking credential in the workflow-states error is redacted", async () => {
+    const port = portWithTransport(
+      respondWith(jsonResponse(401, { message: `Invalid key: ${LEAKED}` })).fetchImpl,
+      { retry: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 } },
+    );
+    const error = await port.setIssueStatus("ALI-1501", "Parked", CYCLE_ID).then(
+      () => {
+        throw new Error("expected a rejection");
+      },
+      (caught: unknown) => caught as Error,
+    );
+    expect(error.message).not.toContain(LEAKED);
+    expect(containsSecretLike(error.message)).toBe(false);
+  });
+
+  it("addComment: a leaked-looking credential in the failure response is redacted, even though the body is echoed", async () => {
+    const port = portWithTransport(
+      respondWith(jsonResponse(401, { message: `Invalid key: ${LEAKED}` })).fetchImpl,
+      { retry: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 } },
+    );
+    const error = await port.addComment("ALI-1502", "a perfectly normal comment").then(
+      () => {
+        throw new Error("expected a rejection");
+      },
+      (caught: unknown) => caught as Error,
+    );
+    expect(error.message).not.toContain(LEAKED);
+    expect(containsSecretLike(error.message)).toBe(false);
+    expect(error.message).toContain("a perfectly normal comment"); // the echo still happened — only the credential is gone
+  });
+
+  it("sends the bare Authorization header (no Bearer) on write mutations too", async () => {
+    const world = defineFakeWorld({ issues: [fakeIssue({ identifier: "ALI-1503" })] });
+    const { port, calls } = portFor(world);
+    await port.addComment("ALI-1503", "hi");
+    const writeCall = calls.find((call) => call.query.includes("DispatcherAddComment"));
+    expect(writeCall?.authorization).toBe(DUMMY_API_KEY);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ALI-159 AC7 — the fake rejects what real Linear rejects, on the write path
+// ---------------------------------------------------------------------------
+
+describe("ALI-159 AC7: the fake's write path encodes Linear's hard rejections too", () => {
+  it("setIssueStatus on an issue id that does not exist is rejected", async () => {
+    const world = defineFakeWorld({ issues: [fakeIssue({ identifier: "ALI-1601" })] });
+    const { port } = portFor(world);
+    await expect(port.setIssueStatus("ALI-DOES-NOT-EXIST", "Parked", CYCLE_ID)).rejects.toThrow(
+      /Entity not found: Issue/,
+    );
+  });
+
+  it("addComment on an issue id that does not exist is rejected", async () => {
+    const world = defineFakeWorld({ issues: [fakeIssue({ identifier: "ALI-1602" })] });
+    const { port } = portFor(world);
+    await expect(port.addComment("ALI-DOES-NOT-EXIST", "hi")).rejects.toThrow(/Entity not found: Issue/);
+  });
+
+  it("the fake itself rejects a state transition to a stateId not in the team's workflow", async () => {
+    // Bypasses the adapter's own resolveStateId pre-check on purpose — this
+    // proves the FAKE's rejection (ALI-155), not the adapter's guard (AC4).
+    const world = defineFakeWorld({ issues: [fakeIssue({ identifier: "ALI-1603", stateName: "Ready", cycleId: CYCLE_ID })] });
+    const { fetchImpl } = createFakeLinear(world);
+    const port = createLinearApiPort({
+      apiKey: DUMMY_API_KEY,
+      teamId: TEAM_ID,
+      endpoint: FAKE_ENDPOINT,
+      sleep: async () => {},
+      fetchImpl: async (url, init) => {
+        const body = JSON.parse(init.body) as { query: string; variables: Record<string, unknown> };
+        if (body.query.includes("DispatcherSetIssueStatus")) {
+          const rewritten = {
+            ...body,
+            variables: { ...body.variables, input: { stateId: "state:Not-A-Real-State", cycleId: CYCLE_ID } },
+          };
+          return fetchImpl(url, { ...init, body: JSON.stringify(rewritten) });
+        }
+        return fetchImpl(url, init);
+      },
+    });
+    await expect(port.setIssueStatus("ALI-1603", "Parked", CYCLE_ID)).rejects.toThrow(/WorkflowState/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC8 — the two unwired methods (ALI-163) are loud stubs that name their owner
+// ---------------------------------------------------------------------------
+
+describe("AC8: getApprovedCycle and postCycleSummary are loud stubs naming ALI-163", () => {
   const port = createLinearApiPort({ apiKey: DUMMY_API_KEY, teamId: TEAM_ID });
 
   const stubs: Array<[string, string, () => unknown]> = [
     ["getApprovedCycle", "ALI-163", () => port.getApprovedCycle()],
     ["postCycleSummary", "ALI-163", () => port.postCycleSummary(CYCLE_ID, "summary")],
-    ["setIssueStatus", "ALI-159", () => port.setIssueStatus("ALI-1", "Parked", CYCLE_ID)],
-    ["addComment", "ALI-159", () => port.addComment("ALI-1", "body")],
   ];
 
   for (const [method, owningIssue, call] of stubs) {
@@ -1083,11 +1610,15 @@ describe("AC8: getApprovedCycle, setIssueStatus, addComment and postCycleSummary
     }
   });
 
-  it("the three read methods are NOT stubs — they reach the transport", async () => {
+  it("the four read+write methods are NOT stubs — they reach the transport", async () => {
     const { port: real, calls } = portFor(defineFakeWorld({ issues: [fakeIssue({ identifier: "ALI-801" })] }));
     await real.getWorkflowStatuses();
     await real.getReadyIssuesInCycle(CYCLE_ID);
-    expect(calls).toHaveLength(2);
+    await real.setIssueStatus("ALI-801", "Parked", CYCLE_ID);
+    await real.addComment("ALI-801", "a comment");
+    // getWorkflowStatuses, getReadyIssuesInCycle, setIssueStatus's write +
+    // re-read (the cycle already matched, so no correction round trip), addComment.
+    expect(calls.length).toBeGreaterThanOrEqual(4);
   });
 });
 
@@ -1429,6 +1960,95 @@ describe("AC9: live contract test against real Linear", () => {
 
         const drift = checkStatusDrift(statuses);
         expect(drift.ok, drift.ok ? "" : statusDriftMessage(drift.missing)).toBe(true);
+      },
+      30_000,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ALI-159 AC9 — write-half live contract test, or a VISIBLE skip
+//
+// A separate variable set from the read-half test above (which stays exactly
+// as ALI-158 left it): this test additionally needs a throwaway issue id to
+// move, so it gates on all three variables independently rather than
+// widening the read-half test's own gate.
+// ---------------------------------------------------------------------------
+
+const WRITE_LIVE_ENV_VARS = [LINEAR_API_KEY_ENV, LINEAR_TEAM_ID_ENV, LINEAR_LIVE_TEST_ISSUE_ID_ENV] as const;
+
+function missingWriteLiveEnvVars(env: Record<string, string | undefined>): string[] {
+  return WRITE_LIVE_ENV_VARS.filter((name) => (env[name] ?? "").trim() === "");
+}
+
+function writeLiveSkipNotice(missing: readonly string[]): string {
+  return (
+    `[ALI-159 AC9] SKIPPING the write-half live Linear contract test — missing environment variable(s): ` +
+    `${missing.join(", ")}. ${LINEAR_LIVE_TEST_ISSUE_ID_ENV} is this issue's own addition, provisioned ` +
+    `alongside ALI-157's two. Until this test has run green once, the cycle verify-and-correct mechanism ` +
+    `is NOT proven against the real system — only against the faithful fake.`
+  );
+}
+
+const missingWriteLiveEnv = missingWriteLiveEnvVars(process.env);
+
+describe("ALI-159 AC9: the write-half live-contract gate is loud, never silent", () => {
+  it("treats an unset OR blank variable as missing, across all three names", () => {
+    expect(missingWriteLiveEnvVars({})).toEqual([LINEAR_API_KEY_ENV, LINEAR_TEAM_ID_ENV, LINEAR_LIVE_TEST_ISSUE_ID_ENV]);
+    expect(
+      missingWriteLiveEnvVars({
+        [LINEAR_API_KEY_ENV]: "k",
+        [LINEAR_TEAM_ID_ENV]: "t",
+        [LINEAR_LIVE_TEST_ISSUE_ID_ENV]: "  ",
+      }),
+    ).toEqual([LINEAR_LIVE_TEST_ISSUE_ID_ENV]);
+    expect(
+      missingWriteLiveEnvVars({
+        [LINEAR_API_KEY_ENV]: "k",
+        [LINEAR_TEAM_ID_ENV]: "t",
+        [LINEAR_LIVE_TEST_ISSUE_ID_ENV]: "ALI-999",
+      }),
+    ).toEqual([]);
+  });
+
+  it("the skip notice names the missing variable and says it is a skip", () => {
+    const notice = writeLiveSkipNotice([LINEAR_LIVE_TEST_ISSUE_ID_ENV]);
+    expect(notice).toContain("SKIPPING");
+    expect(notice).toContain(LINEAR_LIVE_TEST_ISSUE_ID_ENV);
+    expect(notice).toContain("NOT proven against the real system");
+  });
+});
+
+describe("ALI-159 AC9: write-half live contract test against real Linear", () => {
+  if (missingWriteLiveEnv.length > 0) {
+    console.warn(writeLiveSkipNotice(missingWriteLiveEnv));
+    it.skip(
+      `SKIPPED — ${missingWriteLiveEnv.join(", ")} not set; write-half adapter unproven against real Linear`,
+      () => {
+        throw new Error("unreachable: this test is skipped");
+      },
+    );
+  } else {
+    it(
+      "moves the designated throwaway issue Ready -> Parked -> Ready, verifying the cycle lands as requested each time, and restores it",
+      async () => {
+        const port = createLinearApiPort({
+          apiKey: process.env[LINEAR_API_KEY_ENV] as string,
+          teamId: process.env[LINEAR_TEAM_ID_ENV] as string,
+        });
+        const issueId = process.env[LINEAR_LIVE_TEST_ISSUE_ID_ENV] as string;
+
+        // setIssueStatus() itself performs verify-and-correct and THROWS if
+        // the cycle does not land as requested after one correction — so a
+        // call resolving here IS the live proof AC9 asks for, against the
+        // real quirk rather than the fake's model of it.
+        try {
+          await port.setIssueStatus(issueId, "Parked", null);
+        } finally {
+          // Restore even if the assertion above threw — a throwaway issue
+          // left in the wrong state would corrupt the NEXT run of this test.
+          await port.setIssueStatus(issueId, "Ready", null);
+        }
       },
       30_000,
     );
