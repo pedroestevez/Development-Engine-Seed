@@ -354,8 +354,18 @@ function createFakeLinear(world: FakeWorld): { fetchImpl: FetchLike; calls: Reco
         // Hard rejection (AC7): non-null `Query.issue` ⇒ error, not null.
         return graphqlErrors([`Entity not found: Issue - could not find referenced Issue.`]);
       }
+      // Returns `state` as well as `cycle`, because the query asks for both and
+      // real Linear answers what it is asked (security finding F3). The fake
+      // omitted `state`, which is why nothing noticed that the adapter's
+      // "verify the write landed" step was only ever verifying half of it.
       return jsonResponse(200, {
-        data: { issue: { id: issue.identifier, cycle: issue.cycleId === null ? null : { id: issue.cycleId } } },
+        data: {
+          issue: {
+            id: issue.identifier,
+            state: { name: issue.stateName },
+            cycle: issue.cycleId === null ? null : { id: issue.cycleId },
+          },
+        },
       });
     }
 
@@ -1198,7 +1208,12 @@ describe("ALI-159 AC1: setIssueStatus() applies the move, then re-reads and asse
       }
       if (body.query.includes("DispatcherIssueCycle")) {
         readCalls++;
-        return jsonResponse(200, { data: { issue: { id: "ALI-1003", cycle: { id: STUCK_CYCLE } } } });
+        // `state` included because the query asks for it and this test is
+        // isolating the CYCLE correction bound — a stub that omits it would
+        // fail on the status check instead, testing the wrong thing.
+        return jsonResponse(200, {
+          data: { issue: { id: "ALI-1003", state: { name: "Parked" }, cycle: { id: STUCK_CYCLE } } },
+        });
       }
       if (body.query.includes("DispatcherWorkflowStates")) {
         return jsonResponse(200, {
@@ -1384,6 +1399,130 @@ describe("ALI-159 AC3: a status move that succeeds, followed by a failing commen
 // ALI-159 AC4 — an unknown status name is a hard error, and performs NO write
 // ---------------------------------------------------------------------------
 
+describe("Security finding N2: the status memo survives concurrent lanes", () => {
+  // The memo was one slot, justified as "every call site moves then comments
+  // on the same issue". True per call site, false for the process: lanes run
+  // concurrently (`await Promise.all(laneWorkers)` in run.ts), so another
+  // lane's move lands in between. With one slot AC3's guarantee silently
+  // degraded to "usually" — it reported "no status move known" rather than a
+  // wrong status, so it stayed honest, but it stopped being a guarantee.
+  it("names the right issue's status when another issue was moved in between", async () => {
+    const world = defineFakeWorld({
+      issues: [
+        fakeIssue({ identifier: "ALI-1601", stateName: "Ready", cycleId: CYCLE_ID }),
+        fakeIssue({ identifier: "ALI-1602", stateName: "Ready", cycleId: CYCLE_ID }),
+      ],
+      currentCycleId: CYCLE_ID,
+    });
+    const { fetchImpl } = createFakeLinear(world);
+    const port = createLinearApiPort({
+      apiKey: DUMMY_API_KEY,
+      teamId: TEAM_ID,
+      endpoint: FAKE_ENDPOINT,
+      sleep: async () => {},
+      retry: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 },
+      fetchImpl: async (url, init) => {
+        const body = JSON.parse(init.body) as { query: string; variables: Record<string, unknown> };
+        if (body.query.includes("DispatcherAddComment")) {
+          return jsonResponse(403, { message: "comment rejected" });
+        }
+        return fetchImpl(url, init);
+      },
+    });
+
+    // Lane A moves its issue...
+    await port.setIssueStatus("ALI-1601", "Parked", CYCLE_ID);
+    // ...lane B interleaves its own move before lane A gets to its comment.
+    await port.setIssueStatus("ALI-1602", "In Review", CYCLE_ID);
+
+    // Lane A's comment fails. The error must still name ALI-1601's status,
+    // not lane B's, and not "no status move known".
+    await expect(port.addComment("ALI-1601", "resume note, engine sha, pr url")).rejects.toThrow(
+      /The status move to "Parked" DID land/,
+    );
+  });
+});
+
+describe("Security finding F3: a write is not applied just because HTTP said 200", () => {
+  // Both mutations select `success` — the file's own contract-evidence block
+  // quotes `IssuePayload`/`CommentPayload` carrying `success: Boolean!` — and
+  // neither read it. Nothing caught that, because every existing test drove a
+  // fake that always answered `success: true`. A verify that only ever sees
+  // the happy answer is not a verify.
+  const STATE_ID = stateIdFor("Parked");
+
+  function portAnswering(
+    handler: (query: string, variables: Record<string, unknown>) => HttpResponseLike,
+  ) {
+    return portWithTransport(async (_url, init) => {
+      const body = JSON.parse(init.body) as { query: string; variables: Record<string, unknown> };
+      if (body.query.includes("DispatcherWorkflowStates")) {
+        return jsonResponse(200, {
+          data: {
+            team: {
+              states: {
+                nodes: [{ id: STATE_ID, name: "Parked" }],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          },
+        });
+      }
+      return handler(body.query, body.variables);
+    });
+  }
+
+  it("throws when issueUpdate reports success: false with no GraphQL error", async () => {
+    const port = portAnswering((query) => {
+      if (query.includes("DispatcherSetIssueStatus")) {
+        // HTTP 200, no `errors[]`, and the mutation says it did not apply.
+        return jsonResponse(200, { data: { issueUpdate: { success: false } } });
+      }
+      throw new Error(`unexpected: ${query}`);
+    });
+
+    await expect(port.setIssueStatus("ALI-1501", "Parked", CYCLE_ID)).rejects.toThrow(
+      /issueUpdate\.success = false/,
+    );
+  });
+
+  it("throws when commentCreate reports success: false with no GraphQL error", async () => {
+    const port = portAnswering((query) => {
+      if (query.includes("DispatcherAddComment")) {
+        return jsonResponse(200, { data: { commentCreate: { success: false } } });
+      }
+      throw new Error(`unexpected: ${query}`);
+    });
+
+    await expect(port.addComment("ALI-1502", "hello")).rejects.toThrow(/commentCreate\.success = false/);
+  });
+
+  // The other half of F3: the re-read verified only `cycle`. For the three
+  // call sites that pass `cycleId = cycle.id` the issue is ALREADY in that
+  // cycle, so the comparison passed on the first read whether or not the
+  // status had been written — zero verification of the thing the method is
+  // named for.
+  it("throws when the re-read shows the status did not land, even though the cycle matches", async () => {
+    const port = portAnswering((query) => {
+      if (query.includes("DispatcherSetIssueStatus")) {
+        return jsonResponse(200, { data: { issueUpdate: { success: true } } });
+      }
+      if (query.includes("DispatcherIssueCycle")) {
+        // Cycle is exactly what was asked for — so a cycle-only verify passes
+        // — but the state never moved off Ready.
+        return jsonResponse(200, {
+          data: { issue: { id: "ALI-1503", state: { name: "Ready" }, cycle: { id: CYCLE_ID } } },
+        });
+      }
+      throw new Error(`unexpected: ${query}`);
+    });
+
+    await expect(port.setIssueStatus("ALI-1503", "Parked", CYCLE_ID)).rejects.toThrow(
+      /status move did not land — intended "Parked", Linear reports "Ready"/,
+    );
+  });
+});
+
 describe("ALI-159 AC4: setIssueStatus() with an unresolvable status name throws and writes nothing", () => {
   it("throws naming the offending status, before ever attempting a write", async () => {
     const world = defineFakeWorld({ issues: [fakeIssue({ identifier: "ALI-1301", stateName: "Ready" })] });
@@ -1435,20 +1574,71 @@ function failHttpThenDelegate(
 }
 
 describe("ALI-159 AC5: retries never double-write", () => {
-  it("addComment: fails transport once, succeeds on retry — exactly ONE comment, not two", async () => {
+  // ~~"addComment: fails transport once, succeeds on retry — exactly ONE
+  // comment, not two"~~ — this test used to assert that a THROWN transport
+  // error on `addComment` was retried and produced one comment. That
+  // assertion encoded the defect, not the guarantee (security finding F2):
+  // the request carries `AbortSignal.timeout`, which fires AFTER the bytes
+  // are on the wire, so "threw" does not mean "was not delivered". A slow
+  // Linear that accepted the comment in 31s got it posted again — up to four
+  // identical escalations, reported as one success. The fake could never show
+  // that, because its transport failure really did happen before delivery.
+  //
+  // Rewritten to assert the corrected rule. This is a change of what the test
+  // claims, not a relaxation of it: the new assertions are strictly stronger
+  // (zero comments where the old one accepted one, and an explicit throw).
+  it("addComment: a thrown transport error is NOT retried — it fails loudly, posting nothing", async () => {
     const world = defineFakeWorld({ issues: [fakeIssue({ identifier: "ALI-1401" })] });
     const { fetchImpl } = createFakeLinear(world);
+    let attempts = 0;
     const port = createLinearApiPort({
       apiKey: DUMMY_API_KEY,
       teamId: TEAM_ID,
       endpoint: FAKE_ENDPOINT,
       sleep: async () => {},
-      fetchImpl: failTransportThenDelegate("DispatcherAddComment", 1, fetchImpl),
+      fetchImpl: async (url, init) => {
+        const body = JSON.parse(init.body) as { query: string };
+        if (body.query.includes("DispatcherAddComment")) {
+          attempts++;
+          throw new Error("socket hang up");
+        }
+        return fetchImpl(url, init);
+      },
     });
 
-    await port.addComment("ALI-1401", "hello");
+    await expect(port.addComment("ALI-1401", "hello")).rejects.toThrow(LinearApiError);
+    // Exactly one attempt: a comment that may already have been delivered is
+    // never sent again.
+    expect(attempts).toBe(1);
+    expect(world.comments.get("ALI-1401")).toBeUndefined();
+  });
 
-    expect(world.comments.get("ALI-1401")).toEqual(["hello"]);
+  // The other half: a 5xx RESPONSE is Linear stating it did not process the
+  // request, which is a different claim from "no response arrived" — that one
+  // stays retryable, and must still produce exactly one comment.
+  it("addComment: a 5xx response IS retried, and still posts exactly one comment", async () => {
+    const world = defineFakeWorld({ issues: [fakeIssue({ identifier: "ALI-1402" })] });
+    const { fetchImpl } = createFakeLinear(world);
+    let serverErrors = 0;
+    const port = createLinearApiPort({
+      apiKey: DUMMY_API_KEY,
+      teamId: TEAM_ID,
+      endpoint: FAKE_ENDPOINT,
+      sleep: async () => {},
+      fetchImpl: async (url, init) => {
+        const body = JSON.parse(init.body) as { query: string };
+        if (body.query.includes("DispatcherAddComment") && serverErrors === 0) {
+          serverErrors++;
+          return jsonResponse(503, { message: "upstream unavailable" });
+        }
+        return fetchImpl(url, init);
+      },
+    });
+
+    await port.addComment("ALI-1402", "hello");
+
+    expect(serverErrors).toBe(1);
+    expect(world.comments.get("ALI-1402")).toEqual(["hello"]);
   });
 
   it("addComment: a 503 (5xx) is retried too, per AC5's own words — exactly ONE comment", async () => {

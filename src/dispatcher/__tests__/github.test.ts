@@ -44,6 +44,7 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  PUSH_CREDENTIAL_CONFIG_KEY,
   createGitHubApiPort,
   DEFAULT_RETRY_POLICY,
   GITHUB_API_URL,
@@ -218,6 +219,43 @@ describe("AC1 + AC6: pushBranch — real git, throwaway temp-dir repos", () => {
     await execFileAsync("git", ["add", "."], { cwd: dir });
     await execFileAsync("git", ["commit", "-q", "-m", message], { cwd: dir });
   }
+
+  // ── Security finding F1 ───────────────────────────────────────────────────
+  // These two are the assertions whose absence let an unscoped credential
+  // ship. Every pre-existing test here asked "where is the token STORED";
+  // neither asked "where is it SENT". Reverting either half of the fix must
+  // turn one of these red.
+
+  it("F1: the push credential is URL-scoped to the configured host, not attached to every request", () => {
+    // A bare `http.extraheader` is attached by git to EVERY HTTP(S) request,
+    // to any host. Scoping it means a repointed remote simply fails to
+    // authenticate rather than receiving the token.
+    expect(PUSH_CREDENTIAL_CONFIG_KEY).toBe("http.https://github.com/.extraheader");
+    expect(PUSH_CREDENTIAL_CONFIG_KEY).not.toBe("http.extraheader");
+  });
+
+  it("F1: refuses to push when origin has been repointed at another host, and pushes nothing", async () => {
+    const remote = await makeBareRemote();
+    const work = await makeClone(remote, "repointed");
+    await commit(work, "f.txt", "seed\n", "seed");
+    await execFileAsync("git", ["push", "-q", "origin", "HEAD:main"], { cwd: work });
+    await execFileAsync("git", ["checkout", "-q", "-b", "feature"], { cwd: work });
+    await commit(work, "f.txt", "feature change\n", "feature commit");
+
+    // Exactly what a build seat could do: seats run with cwd = the worktree
+    // and are deliberately NOT given this token (SEAT_ENV_ALLOWLIST), so
+    // redirecting the push was the way to make the push hand it over.
+    await execFileAsync("git", ["config", "remote.origin.pushurl", "https://collector.example/x.git"], {
+      cwd: work,
+    });
+
+    const port = createGitHubApiPort({ token: DUMMY_TOKEN, owner: OWNER, repo: REPO });
+    await expect(port.pushBranch(work, "feature")).rejects.toThrow(/Refusing to push/);
+
+    // And the branch never left: the refusal happens before git is invoked.
+    const { stdout } = await execFileAsync("git", ["ls-remote", "--heads", remote, "feature"]);
+    expect(stdout).not.toContain("refs/heads/feature");
+  });
 
   it("pushes branch to origin — the remote actually receives it", async () => {
     const remote = await makeBareRemote();
