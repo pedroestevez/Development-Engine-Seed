@@ -9,9 +9,11 @@
  * `EnginePinPort` are given real adapters here — unlike `AgentPort` and
  * `LinearPort`, both only need local git and the filesystem, so they can be
  * both real *and* hermetically tested (no network, no credentials) with an
- * actual temp-dir git repo. `GitHubPort` needs real network + credentials,
- * so its real adapter is a thin stub — same treatment as `LinearPort` (see
- * that file's doc comment).
+ * actual temp-dir git repo. `GitHubPort` needs real network + a real GitHub
+ * token — a different concern, so only its interfaces (`GitHubPort`,
+ * `DraftPrParams`, `DraftPrResult`) stay here; its real adapter lives in
+ * `./github.ts` (ALI-160), which also carries that adapter's own doc
+ * comment on why the split.
  */
 
 import { execFile } from "node:child_process";
@@ -171,26 +173,5 @@ export function createGitEnginePinPort(repoRoot: string, pinnedTreesDir: string)
       await execFileAsync("git", ["worktree", "add", "--detach", path, pin], { cwd: repoRoot });
       return path;
     },
-  };
-}
-
-/**
- * Real adapter — intentionally a thin stub for this PR (see `linear.ts`'s
- * `createLinearApiPort` doc comment for the same reasoning): needs real
- * network + a real GitHub token, out of scope for the runtime-logic issue
- * this PR builds. The run loop is fully exercised against a fake instead.
- */
-export function createGitHubApiPort(_config: { token: string; owner: string; repo: string }): GitHubPort {
-  const notWired = (method: string) => {
-    return (): never => {
-      throw new Error(
-        `GitHubPort real adapter not wired in this PR (${method}) — see the ALI-103 PR's ` +
-          '"Decisions the spec left open" section.',
-      );
-    };
-  };
-  return {
-    pushBranch: notWired("pushBranch"),
-    openDraftPr: notWired("openDraftPr"),
   };
 }
