@@ -545,21 +545,35 @@ function backoffDelayMs(attempt: number, retryAfterHeader: string | null, policy
  * exception (fetchImpl rejecting before any response is received) —
  * scoped to the write path only, via the `retryServerErrors` option below.
  *
- * Why safe to retry there and NOT elsewhere: both conditions are ones "the
- * adapter can show did not apply" (the issue's own words) — a 5xx is Linear
- * telling us the request was not processed, and a transport exception means
- * the request never completed a round trip at all. Resending in either case
- * cannot turn one intended write into two *because* the first attempt never
- * got as far as being applied. A 200 with a GraphQL error, or any other 4xx,
- * is a different claim — Linear DID look at the request and rejected it —
- * and those are never retried, exactly as before.
+ * ~~Why safe to retry there and NOT elsewhere: both conditions are ones "the
+ * adapter can show did not apply"... a transport exception means the request
+ * never completed a round trip at all.~~ **That claim was wrong** (security
+ * finding F2), and it is struck rather than deleted because the reasoning is
+ * the thing that has to not be reused: it would license the same mistake at
+ * the next call site.
  *
- * Reads keep the narrower ALI-158 policy (`retryServerErrors` defaults to
- * `false`): their retry behaviour, and the tests pinned to it (AC5's
- * "does NOT retry a non-rate-limit failure"), are unchanged.
+ * A 5xx IS Linear saying it did not process the request. A *thrown* exception
+ * is not — `AbortSignal.timeout` fires after the request bytes are on the
+ * wire, and a reset or hang-up while awaiting the response looks identical
+ * from here. "May have been applied" and "never sent" are indistinguishable
+ * to the client, so replaying is only safe when replaying is harmless.
+ *
+ * Hence two flags, not one:
+ *   • `retryServerErrors` — retry an HTTP 5xx *response*. Safe for any write:
+ *     the server told us it did not process the request.
+ *   • `replaySafe` — additionally retry a thrown transport exception. Only
+ *     for operations where applying twice equals applying once. `issueUpdate`
+ *     qualifies (setting the same state twice is the same state).
+ *     `commentCreate` does NOT: a replay posts the comment again, which is
+ *     how a slow-but-successful escalation becomes four identical comments
+ *     with the run reporting one success.
+ *
+ * Reads keep the narrower ALI-158 policy (both default to `false`): their
+ * retry behaviour, and the tests pinned to it, are unchanged.
  */
 interface ExecuteGraphQLOptions {
   retryServerErrors?: boolean;
+  replaySafe?: boolean;
 }
 
 /**
@@ -583,6 +597,8 @@ async function executeGraphQL(
 ): Promise<Record<string, unknown>> {
   const { retry } = runtime;
   const retryServerErrors = options.retryServerErrors ?? false;
+  // F2: strictly narrower than `retryServerErrors` — never defaulted from it.
+  const replaySafe = options.replaySafe ?? false;
 
   for (let attempt = 1; attempt <= retry.maxAttempts; attempt++) {
     let response: HttpResponseLike;
@@ -599,7 +615,21 @@ async function executeGraphQL(
         signal: AbortSignal.timeout(runtime.requestTimeoutMs),
       });
     } catch (cause) {
-      if (retryServerErrors && attempt < retry.maxAttempts) {
+      // F2: a thrown transport error does NOT mean the request was never
+      // delivered. `signal: AbortSignal.timeout(...)` above fires *after* the
+      // bytes are on the wire, and a reset or hang-up while awaiting the
+      // response is the same shape — "may have been applied" is
+      // indistinguishable from "never sent" from here. An earlier version
+      // retried this branch whenever `retryServerErrors` was set, which for
+      // `commentCreate` meant a slow-but-successful write got posted again:
+      // up to four identical escalation comments, reported as one success.
+      //
+      // So retry-on-throw is gated on the caller declaring the operation
+      // replay-safe, not on it being a write. `issueUpdate` is idempotent
+      // (setting the same state twice is the same state); `commentCreate` is
+      // not. The sibling adapter reached the same conclusion independently —
+      // `github.ts` refuses to retry this class outright.
+      if (replaySafe && attempt < retry.maxAttempts) {
         await runtime.sleep(backoffDelayMs(attempt, null, retry));
         continue;
       }
@@ -1075,10 +1105,21 @@ const SET_ISSUE_FIELDS_MUTATION = `
 `;
 
 /** The re-read half of verify-and-correct (AC1) — cycle only; nothing else about the issue is this method's business. */
+/**
+ * Reads BOTH halves the write claimed to set (security finding F3).
+ *
+ * It read only `cycle` before. That made the verify vacuous for three of the
+ * four call sites: `run.ts` passes `cycleId = cycle.id` for Parked, In Review
+ * and In Progress, and the issue is ALREADY in that cycle — so the comparison
+ * passed on the first read whether or not anything had been written. A verify
+ * that passes trivially in the common case is indistinguishable from no
+ * verify at all, on the one method the Direction gate depends on.
+ */
 const ISSUE_CYCLE_QUERY = `
   query DispatcherIssueCycle($issueId: String!) {
     issue(id: $issueId) {
       id
+      state { name }
       cycle { id }
     }
   }
@@ -1172,6 +1213,34 @@ async function resolveStateId(runtime: AdapterRuntime, status: IssueState): Prom
  * a broken response masquerade as a successful clear, so it throws instead
  * of silently returning `null`.
  */
+/**
+ * A GraphQL mutation that reports its own failure without raising a GraphQL
+ * error (security finding F3).
+ *
+ * Both write mutations select `success` — the contract-evidence block above
+ * quotes `IssuePayload`/`CommentPayload` carrying `success: Boolean!` — and
+ * neither read it. A 200 carrying `{"data":{"issueUpdate":{"success":false}}}`
+ * and no `errors[]` was treated as applied.
+ */
+function assertMutationSucceeded(
+  data: Record<string, unknown>,
+  field: string,
+  issueId: string,
+): void {
+  const payload = asRecord(data[field]);
+  if (payload === null) {
+    throw new LinearApiError(
+      `${issueId}: Linear returned no \`${field}\` payload. An absent payload is not a successful write.`,
+    );
+  }
+  if (payload.success !== true) {
+    throw new LinearApiError(
+      `${issueId}: Linear reported \`${field}.success = ${String(payload.success)}\` with no GraphQL error. ` +
+        "A mutation that reports its own failure is a failure, however clean the HTTP status looked.",
+    );
+  }
+}
+
 function readObservedCycleId(data: Record<string, unknown>, issueId: string): string | null {
   const issue = asRecord(data.issue);
   if (issue === null) {
@@ -1184,6 +1253,23 @@ function readObservedCycleId(data: Record<string, unknown>, issueId: string): st
     throw new LinearApiError(`${issueId}: Linear returned a \`cycle\` with no usable id when re-reading it.`);
   }
   return cycleId;
+}
+
+/** The state name Linear reports after a write — the other half of F3's verify. */
+function readObservedStateName(data: Record<string, unknown>, issueId: string): string {
+  const issue = asRecord(data.issue);
+  if (issue === null) {
+    throw new LinearApiError(`${issueId}: Linear returned no issue when re-reading its state after a status move.`);
+  }
+  const state = asRecord(issue.state);
+  const name = state?.name;
+  if (typeof name !== "string" || name.trim() === "") {
+    throw new LinearApiError(
+      `${issueId}: Linear returned an issue with no usable state name when re-reading it after a status move. ` +
+        "Treating an unreadable state as a successful move is the fail-open this verify exists to prevent.",
+    );
+  }
+  return name;
 }
 
 /** Renders `null` readably inside an error message — `"null"` vs a UUID, never ambiguous with an empty string. */
@@ -1240,12 +1326,22 @@ export function createLinearApiPort(config: LinearApiConfig): LinearPort {
    * names the status only when a test's fixture happens to mention it. That is
    * a property of the fixture, not of the system.
    *
-   * One slot, not a map: every call site in `run.ts` performs `setIssueStatus`
-   * immediately followed by `addComment` on the same issue, so a single slot
-   * covers the real pattern and cannot grow without bound. A comment on any
-   * other issue reports that no status move is known — never a guess.
+   * ~~One slot, not a map: every call site performs `setIssueStatus`
+   * immediately followed by `addComment` on the same issue.~~ **Struck** —
+   * true call-site by call-site, false for the process (security finding N2).
+   * Lanes run concurrently (`await Promise.all(laneWorkers)` in `run.ts`), so
+   * another lane's status move lands between a lane's own move and its
+   * comment, and the single slot stops describing the issue being commented
+   * on. The id guard kept it honest rather than wrong — it reported "no
+   * status move known" — but AC3's guarantee silently degraded to "usually"
+   * under exactly the concurrency this engine is built for.
+   *
+   * A per-issue map restores it, and stays bounded by deleting each entry as
+   * it is consumed or superseded: at most one entry per issue in flight,
+   * rather than growth for the life of the process. `run.ts`'s blind-QA-skip
+   * comment has no preceding status move at all, and correctly reports none.
    */
-  let lastApplied: { issueId: string; status: IssueState } | null = null;
+  const lastApplied = new Map<string, IssueState>();
 
 
   return {
@@ -1360,18 +1456,23 @@ export function createLinearApiPort(config: LinearApiConfig): LinearPort {
       const stateId = await resolveStateId(runtime, status);
 
       async function applyIssueUpdate(input: Record<string, unknown>): Promise<void> {
-        await executeGraphQL(
+        const data = await executeGraphQL(
           runtime,
           "DispatcherSetIssueStatus",
           SET_ISSUE_FIELDS_MUTATION,
           { issueId, input },
-          // AC5: a write that never got a response, or that Linear explicitly
-          // says it did not process (429/5xx), is safe to resend — see
-          // ExecuteGraphQLOptions's doc comment for why this cannot double-write.
-          { retryServerErrors: true },
+          // AC5 + F2. `issueUpdate` is idempotent — setting the same state and
+          // cycle twice leaves the same issue — so BOTH a 5xx response and a
+          // thrown transport error are safe to replay here.
+          { retryServerErrors: true, replaySafe: true },
         );
+        // F3: `success` was selected by this mutation and never read. Linear
+        // can answer HTTP 200 with `success: false` and no `errors[]`, which
+        // sailed straight through as "applied". Never a silent no-op.
+        assertMutationSucceeded(data, "issueUpdate", issueId);
       }
 
+      /** Re-reads both halves and hard-fails on the status half immediately. */
       async function readObservedCycle(): Promise<string | null> {
         const data = await executeGraphQL(
           runtime,
@@ -1380,6 +1481,20 @@ export function createLinearApiPort(config: LinearApiConfig): LinearPort {
           { issueId },
           { retryServerErrors: true },
         );
+
+        // F3: the status half is verified here rather than alongside the cycle
+        // comparison, because the cycle has a correction path and this does
+        // not — if the state did not land, no re-save of the cycle field will
+        // fix it, so there is nothing to do but fail loudly.
+        const observedState = readObservedStateName(data, issueId);
+        if (observedState !== status) {
+          throw new LinearApiError(
+            `${issueId}: status move did not land — intended "${status}", Linear reports "${observedState}". ` +
+              "Reporting this as moved would leave the board disagreeing with the run log, which is the " +
+              "exact failure the loud stub this method replaced existed to prevent.",
+          );
+        }
+
         return readObservedCycleId(data, issueId);
       }
 
@@ -1391,7 +1506,7 @@ export function createLinearApiPort(config: LinearApiConfig): LinearPort {
 
       let observedCycleId = await readObservedCycle();
       if (observedCycleId === cycleId) {
-        lastApplied = { issueId, status };
+        lastApplied.set(issueId, status);
         return;
       }
 
@@ -1402,7 +1517,7 @@ export function createLinearApiPort(config: LinearApiConfig): LinearPort {
       await applyIssueUpdate({ cycleId });
       observedCycleId = await readObservedCycle();
       if (observedCycleId === cycleId) {
-        lastApplied = { issueId, status };
+        lastApplied.set(issueId, status);
         return;
       }
 
@@ -1431,21 +1546,34 @@ export function createLinearApiPort(config: LinearApiConfig): LinearPort {
         );
       }
       try {
-        await executeGraphQL(
+        const data = await executeGraphQL(
           runtime,
           "DispatcherAddComment",
           ADD_COMMENT_MUTATION,
           { issueId, body },
-          // AC5, same reasoning as setIssueStatus above.
+          // AC5 + F2. Deliberately NOT `replaySafe`: a comment replayed after a
+          // timeout that actually delivered posts it twice. A 5xx is still
+          // retried (Linear said it did not process the request); a thrown
+          // transport error is not, because it cannot be distinguished from a
+          // delivered-but-unanswered write. One missing comment on a stored
+          // status move is recoverable; four identical escalations are noise
+          // nobody can tell from a real repeat.
           { retryServerErrors: true },
         );
+        // F3: same as the status write — `success` is on the wire, so read it.
+        assertMutationSucceeded(data, "commentCreate", issueId);
       } catch (cause) {
         // AC3: name the status this port actually applied, from the memo —
         // not from the body, which in production never mentions it.
+        // Consumed on read: this comment was the operation the memo existed to
+        // describe, so holding it afterwards would only let a later, unrelated
+        // failure inherit a stale attribution.
+        const moved = lastApplied.get(issueId);
+        lastApplied.delete(issueId);
         const applied =
-          lastApplied && lastApplied.issueId === issueId
-            ? `The status move to "${lastApplied.status}" DID land and is NOT undone by this failure`
-            : "No status move by this adapter instance is known for this issue";
+          moved === undefined
+            ? "No status move by this adapter instance is known for this issue"
+            : `The status move to "${moved}" DID land and is NOT undone by this failure`;
         throw new LinearApiError(
           `${issueId}: addComment failed (${describeCause(cause)}). ${applied} — Linear's board and the ` +
             "run log can now disagree, so this is never swallowed. Comment attempted: " +

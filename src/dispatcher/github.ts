@@ -335,6 +335,13 @@ function validateConfig(config: GitHubApiConfig): AdapterRuntime {
   // Registered only after every validation has passed, so a rejected config
   // never adds a value to the redaction set.
   rememberCredential(config.token);
+  // N1: the raw token is not the only form that can escape. What git puts on
+  // the wire — and therefore what could appear in git's own diagnostics — is
+  // base64("x-access-token:" + token), which neither this set nor
+  // `scrubSecrets`'s prefix vocabulary would have matched. Redacting only the
+  // form we happen to hold leaves a blind spot exactly where the credential
+  // is materialized.
+  rememberCredential(encodedCredential(config.token));
 
   return {
     endpoint: config.endpoint ?? GITHUB_API_URL,
@@ -391,18 +398,108 @@ function describeExecError(cause: unknown): string {
  * evaporates when the child exits — nothing to clean up, nothing that
  * survives a crash mid-push.
  *
- * Scoped to `http.extraheader` (unscoped, not URL-scoped) because this
- * invocation only ever touches one remote (`origin`) in one call — the
- * narrower `http.<url>.extraheader` form `linear.ts`'s sibling would reach
- * for is unnecessary defense here for a single, dedicated subprocess.
+ * **URL-scoped, and that scoping is load-bearing** (security finding F1).
+ * An earlier version used the bare `http.extraheader` key, justified as "this
+ * invocation only ever touches one remote (`origin`)". That conflated the
+ * remote's *name* with the *URL it resolves to*. This adapter controls the
+ * name; it does not control the URL. Git attaches a bare `http.extraheader`
+ * to every HTTP(S) request it makes, to any host.
+ *
+ * Why that was exploitable, concretely: `SEAT_ENV_ALLOWLIST` (`agent.ts`)
+ * deliberately withholds this token from build seats — "Never the run's
+ * Linear/GitHub tokens" — but seats are real processes whose `cwd` is the
+ * worktree, and `pushBranch` runs against that same worktree afterwards
+ * (`run.ts`). A seat that writes `remote.origin.pushurl`, or a
+ * `url.<x>.insteadOf` rule, into the config it shares with this repo would
+ * have redirected the push — and an unscoped header would have handed the
+ * attacker `Authorization: Basic base64("x-access-token:" + TOKEN)`. Base64
+ * is reversible. The engine's own trust boundary would have been crossed by
+ * the very component designed never to hold this credential.
+ *
+ * With the key scoped to the configured host, a repointed remote simply
+ * fails to authenticate instead of exfiltrating. `assertRemoteIsExpected()`
+ * below is the second layer: the push is refused before git is ever handed
+ * the token.
  */
 function pushEnv(token: string): NodeJS.ProcessEnv {
   return {
     ...process.env,
     GIT_CONFIG_COUNT: "1",
-    GIT_CONFIG_KEY_0: "http.extraheader",
-    GIT_CONFIG_VALUE_0: `Authorization: Basic ${Buffer.from(`x-access-token:${token}`, "utf8").toString("base64")}`,
+    GIT_CONFIG_KEY_0: PUSH_CREDENTIAL_CONFIG_KEY,
+    GIT_CONFIG_VALUE_0: `Authorization: Basic ${encodedCredential(token)}`,
   };
+}
+
+/**
+ * The only host this adapter will ever hand the push credential to.
+ *
+ * A constant rather than derived from `endpoint`: `endpoint` is the REST API
+ * base (`api.github.com`), the push target is the git host, and letting one
+ * imply the other is how a config change in one silently widens the other.
+ */
+const GITHUB_REMOTE_PREFIX = "https://github.com/";
+
+/**
+ * The git config key the push credential is attached to — exported so a test
+ * can assert its *scoping*, not merely its absence from disk.
+ *
+ * Security finding F1 shipped once with the bare `http.extraheader` key and no
+ * test caught it, because every existing assertion was about where the
+ * credential is STORED. Where it is SENT needs its own assertion.
+ */
+export const PUSH_CREDENTIAL_CONFIG_KEY = `http.${GITHUB_REMOTE_PREFIX}.extraheader`;
+
+/** The exact bytes git puts on the wire — see `rememberCredential` (N1). */
+function encodedCredential(token: string): string {
+  return Buffer.from(`x-access-token:${token}`, "utf8").toString("base64");
+}
+
+/**
+ * Refuse to push unless `origin` still points where this adapter expects
+ * (security finding F1, second layer).
+ *
+ * Checked immediately before the push and read from the worktree itself, so
+ * it observes whatever a seat may have written rather than what this process
+ * configured. `--push` resolves `remote.origin.pushurl` when set and falls
+ * back to `remote.origin.url`, which is exactly the precedence git will use.
+ */
+async function assertRemoteIsExpected(
+  runtime: AdapterRuntime,
+  worktreePath: string,
+): Promise<void> {
+  let url: string;
+  try {
+    const { stdout } = await execFileAsync("git", ["remote", "get-url", "--push", "origin"], {
+      cwd: worktreePath,
+    });
+    url = stdout.trim();
+  } catch (cause) {
+    throw new GitHubApiError(
+      `Could not read the push URL of "origin" in ${worktreePath}: ${describeExecError(cause)}. ` +
+        "Refusing to push rather than hand a credential to a remote this adapter cannot verify.",
+      { cause },
+    );
+  }
+
+  // Only HTTP(S) remotes can receive the header at all: it is keyed
+  // `http.https://github.com/.extraheader`, so git attaches it to matching
+  // HTTPS requests and to nothing else. A filesystem or SSH remote is
+  // therefore not an exfiltration path for THIS credential, and the hermetic
+  // push tests rely on that (they push to a temp-dir repo). Redirecting a
+  // push to a local path is a different and much smaller problem — the PR
+  // this run is about to open would then fail to find its head — and it is
+  // not one this guard is the right place to solve.
+  if (!/^https?:\/\//i.test(url)) return;
+
+  const expected = `${GITHUB_REMOTE_PREFIX}${runtime.owner}/${runtime.repo}`;
+  const normalized = url.replace(/\.git$/, "");
+  if (normalized !== expected) {
+    throw new GitHubApiError(
+      `Refusing to push: "origin" in ${worktreePath} resolves to ${normalized}, not ${expected}. ` +
+        "The push credential is only ever sent to the configured repository — a remote repointed " +
+        "after this run started is treated as hostile, not as a reconfiguration to follow.",
+    );
+  }
 }
 
 async function pushBranchImpl(runtime: AdapterRuntime, worktreePath: string, branch: string): Promise<void> {
@@ -420,6 +517,8 @@ async function pushBranchImpl(runtime: AdapterRuntime, worktreePath: string, bra
     // normally rather than this call trying to make it succeed. AC1's whole
     // requirement is that a rejection surfaces as a thrown error, never as
     // a silently-forced overwrite.
+    // F1: verified BEFORE the credential is put in the child's environment.
+    await assertRemoteIsExpected(runtime, worktreePath);
     await execFileAsync("git", ["push", "origin", `${branch}:${branch}`], {
       cwd: worktreePath,
       env: pushEnv(runtime.token),
