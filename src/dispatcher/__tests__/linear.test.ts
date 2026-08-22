@@ -1325,11 +1325,50 @@ describe("ALI-159 AC3: a status move that succeeds, followed by a failing commen
     await port.setIssueStatus(ISSUE_ID, "Parked", CYCLE_ID);
     expect(worldCycleOf(world, ISSUE_ID)).toBe(CYCLE_ID);
 
-    // The comment body itself is what the caller (run.ts) uses to record
-    // status context; addComment echoes back what it attempted to post so a
-    // failure here still names the status alongside the issue.
-    await expect(port.addComment(ISSUE_ID, "Status: Parked — interrupted by the run backstop.")).rejects.toThrow(
+    // The body is copied from `run.ts`'s REAL Parked call site
+    // (finalizeParked: resume note + engine SHA + PR url). It deliberately
+    // contains no status word anywhere — because none of run.ts's actual
+    // bodies do. An earlier version of this test used a body that spelled out
+    // "Status: Parked", which made the assertion pass against a fixture that
+    // had been written to satisfy it rather than against the adapter. The
+    // status must come from the adapter's own memory of the move it landed.
+    const REAL_RUN_TS_BODY =
+      "Resume from: reviewer. Builder and blind QA completed.\n\n" +
+      "Engine SHA: `9064706`.\nPR: https://github.com/pedroestevez/Development-Engine-Seed/pull/99";
+    expect(REAL_RUN_TS_BODY).not.toMatch(/Parked|Needs Pedro|In Review/);
+
+    await expect(port.addComment(ISSUE_ID, REAL_RUN_TS_BODY)).rejects.toThrow(
       new RegExp(`${ISSUE_ID}.*Parked`, "s"),
+    );
+  });
+
+  // The other half of the same guarantee: the adapter must not attribute a
+  // status move to an issue it never moved. Naming a status that was never
+  // applied would be the same dishonesty in the opposite direction.
+  it("reports no known status move when the comment is for an issue this port never moved", async () => {
+    const world = defineFakeWorld({
+      issues: [fakeIssue({ identifier: "ALI-1203", stateName: "Ready", cycleId: CYCLE_ID })],
+      currentCycleId: CYCLE_ID,
+    });
+    const { fetchImpl } = createFakeLinear(world);
+    const port = createLinearApiPort({
+      apiKey: DUMMY_API_KEY,
+      teamId: TEAM_ID,
+      endpoint: FAKE_ENDPOINT,
+      sleep: async () => {},
+      retry: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 },
+      fetchImpl: async (url, init) => {
+        const body = JSON.parse(init.body) as { query: string };
+        if (body.query.includes("DispatcherAddComment")) {
+          return jsonResponse(403, { message: "comment rejected" });
+        }
+        return fetchImpl(url, init);
+      },
+    });
+
+    // No setIssueStatus call at all on this port instance.
+    await expect(port.addComment("ALI-1203", "a comment with no prior status move")).rejects.toThrow(
+      /No status move by this adapter instance is known/,
     );
   });
 

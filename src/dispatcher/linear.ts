@@ -1228,6 +1228,26 @@ function loudStub(method: string, owningIssue: string, consequence: string): () 
 export function createLinearApiPort(config: LinearApiConfig): LinearPort {
   const runtime = validateConfig(config);
 
+  /**
+   * The last status move this port actually landed (AC3).
+   *
+   * `addComment` cannot take a status parameter — the port contract does not
+   * have one — but AC3 requires a failed comment to name the status that was
+   * already applied, so the run log records an honest partial write instead of
+   * a clean-looking one. Echoing the comment *body* is not enough: `run.ts`'s
+   * real bodies are resume notes, ambiguity questions and seat summaries, and
+   * none of them contains the status word, so an error built from the body
+   * names the status only when a test's fixture happens to mention it. That is
+   * a property of the fixture, not of the system.
+   *
+   * One slot, not a map: every call site in `run.ts` performs `setIssueStatus`
+   * immediately followed by `addComment` on the same issue, so a single slot
+   * covers the real pattern and cannot grow without bound. A comment on any
+   * other issue reports that no status move is known — never a guess.
+   */
+  let lastApplied: { issueId: string; status: IssueState } | null = null;
+
+
   return {
     async getWorkflowStatuses(): Promise<string[]> {
       const states = await resolveWorkflowStates(runtime);
@@ -1370,7 +1390,10 @@ export function createLinearApiPort(config: LinearApiConfig): LinearPort {
       await applyIssueUpdate({ stateId, cycleId });
 
       let observedCycleId = await readObservedCycle();
-      if (observedCycleId === cycleId) return;
+      if (observedCycleId === cycleId) {
+        lastApplied = { issueId, status };
+        return;
+      }
 
       // AC2, both directions: whether `cycleId` was `null` (caller wants no
       // cycle) or a specific id (caller wants a DIFFERENT cycle than the one
@@ -1378,7 +1401,10 @@ export function createLinearApiPort(config: LinearApiConfig): LinearPort {
       // re-sending `stateId`, which is what would re-arm the quirk.
       await applyIssueUpdate({ cycleId });
       observedCycleId = await readObservedCycle();
-      if (observedCycleId === cycleId) return;
+      if (observedCycleId === cycleId) {
+        lastApplied = { issueId, status };
+        return;
+      }
 
       throw new LinearApiError(
         `${issueId}: cycle verify-and-correct failed after the one correction this adapter allows — ` +
@@ -1414,10 +1440,16 @@ export function createLinearApiPort(config: LinearApiConfig): LinearPort {
           { retryServerErrors: true },
         );
       } catch (cause) {
+        // AC3: name the status this port actually applied, from the memo —
+        // not from the body, which in production never mentions it.
+        const applied =
+          lastApplied && lastApplied.issueId === issueId
+            ? `The status move to "${lastApplied.status}" DID land and is NOT undone by this failure`
+            : "No status move by this adapter instance is known for this issue";
         throw new LinearApiError(
-          `${issueId}: addComment failed (${describeCause(cause)}). A status move that already succeeded ` +
-            "earlier in this same operation is NOT undone by this failure — Linear's board and the run " +
-            `log can now disagree, so this is never swallowed. Comment attempted: ${snippet(body)}`,
+          `${issueId}: addComment failed (${describeCause(cause)}). ${applied} — Linear's board and the ` +
+            "run log can now disagree, so this is never swallowed. Comment attempted: " +
+            `${snippet(body)}`,
           { cause },
         );
       }
