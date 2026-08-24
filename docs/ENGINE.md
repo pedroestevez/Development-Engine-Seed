@@ -271,7 +271,7 @@ Everything verifiable and contained runs without Pedro. His entire surface is:
 
 That's it. Define and approve; the engine does the rest.
 
-Pedro (or an interactive session he's driving — chat, an ad hoc audit, architecture discussion) writes a vault note in the same session when a decision's reasoning isn't captured elsewhere, an investigation produces a finding, or a disagreement resolves into a sharper conclusion. This is a side action around engine work, the same category as Pedro reading Linear himself — never a runtime dependency. The crew's memory stays exactly the three stores in §10: no dispatched seat — orchestrator, spec/BA, builder, blind QA, reviewer, planner (including its Coach role), researcher, scribe, explore, security, or any seat added later — writes to the vault as part of issue execution, and none may be made to depend on it.
+Pedro (or an interactive session he's driving — chat, an ad hoc audit, architecture discussion) writes a vault note in the same session when a decision's reasoning isn't captured elsewhere, an investigation produces a finding, or a disagreement resolves into a sharper conclusion. This is a side action around engine work, the same category as Pedro reading Linear himself — never a runtime dependency. The crew's memory stays exactly the three stores in §10: no dispatched seat — orchestrator, spec/BA, builder, blind QA, reviewer, planner (including its Coach role), researcher, scribe, explore, security, or any seat added later — ever writes to the vault, at any pipeline stage or in any capacity, and none may be made to depend on it.
 
 ---
 
