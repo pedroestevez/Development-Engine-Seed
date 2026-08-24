@@ -2,6 +2,21 @@
 
 This repo is the seed of an autonomous build crew. Full spec: `docs/ENGINE.md` (source of truth). Short rules the crew loads every run:
 
+## The three repos — engine, playbook, vault
+
+| Repo | Holds | Delete it and… |
+| -- | -- | -- |
+| `development-engine-seed` | How *software* gets built — the crew, the dispatcher, the two gates, the Linear state machine | no product repo can be built by the crew |
+| `aligncompass-playbook` | How a *website* gets built — the six-stage pipeline in `skills/`, the Astro `template/` | no customer site can be built |
+| `vault` | *Why* any of it is the way it is | everything still builds; Pedro re-derives |
+
+Two facts an agent working only in this repo is likely to get wrong:
+
+1. **This engine cannot build a website.** `website` appears exactly once in this repo's entire corpus (`ENGINE.md` §4), naming Customer sites as a *product* the engine builds for — zero mentions of Astro, StoryBrand, Cloudinary, or copy. Do not treat customer-site work as in scope here.
+2. **The playbook breaks §11's 1:1 repo↔project rule deliberately.** §11 requires each product repo ↔ one Linear project for credential scoping. Customer sites are *many* repos → one **Customer sites** project. That is correct there and must not be "fixed" to match this spec.
+
+The generating distinction: **the engine is continuous, the playbook is one-shot.** This engine is built to stop safely (§3: no issue ever ends a run in "In Progress"); the site pipeline is built never to stop. Opposite safety properties, so neither can absorb the other.
+
 ## The two gates — never route around them
 
 **Automate the loop. Gate the loop that changes the loop.**
@@ -29,6 +44,7 @@ Cluster by **files touched**, not similarity. Same files → one routine, sequen
 - Never merge to `main`. Never approve your own work. Reviewer never writes features; builder never reviews itself.
 - The blind test-author (`qa.md`) reads only the issue's acceptance criteria, invariant, and definition of done — never the diff, the implementation, or the PR.
 - Memory is lean: git (what's built), Linear (what was decided + the work-graph + goals — there is no GOAL.md), skills + this file (how to build). Add no queues, vector stores, or graph DBs to the engine.
+- Interactive sessions (never the dispatcher loop) write insight and decision reasoning to the vault in the same session it happens — see `ENGINE.md` §15.
 - Self-improvement is the planner's Coach role (`docs/ENGINE.md` §7), not a separate seat: at most one evidence-backed PR per retro against engine files — it never edits them directly.
 - Escalation: Telegram/WhatsApp channel + "Needs Pedro" state. Summaries short.
 - Secrets live in env, never in code, logs, or Linear.
