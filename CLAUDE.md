@@ -7,7 +7,7 @@ This repo is the seed of an autonomous build crew. Full spec: `docs/ENGINE.md` (
 | Repo | Holds | Delete it and… |
 | -- | -- | -- |
 | `development-engine-seed` | How *software* gets built — the crew, the dispatcher, the two gates, the Linear state machine | no product repo can be built by the crew |
-| `aligncompass-playbook` | How a *website* gets built — skills, the Astro template, deploy doctrine | no customer site can be built |
+| the site playbook (its own repo) | How a *website* gets built — skills, the Astro template, deploy doctrine | no customer site can be built |
 | `vault` | *Why* any of it is the way it is | everything still builds; Pedro re-derives |
 
 Two facts an agent working only in this repo is likely to get wrong:
